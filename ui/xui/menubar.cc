@@ -269,6 +269,7 @@ void ShowMainMenu()
             ImGui::Separator();
             ImGui::MenuItem("Pointer Finder", NULL);
             ImGui::MenuItem("Pointer Inspector", NULL);
+            ImGui::EndMenu();
         }
 
         g_main_menu_height = ImGui::GetWindowHeight();
