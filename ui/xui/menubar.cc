@@ -248,6 +248,29 @@ void ShowMainMenu()
             ImGui::EndMenu();
         }
 
+        if (ImGui::BeginMenu("RetroAchievements")) {
+            ImGui::MenuItem("Login", NULL);
+            ImGui::Separator();
+            ImGui::MenuItem("Hardcore Mode", NULL); // Need to update to show as a toggle (enabled/disabled)
+            ImGui::MenuItem("Non-Hardcore Warning", NULL);
+            ImGui::Separator();
+            ImGui::MenuItem("Enable Leaderboards", NULL);
+            ImGui::MenuItem("Overlay Settings", NULL);
+            ImGui::Separator();
+            ImGui::MenuItem("Open All", NULL);
+            ImGui::MenuItem("Assets List", NULL);
+            ImGui::MenuItem("Assets Editor", NULL);
+            if (ImGui::MenuItem("Memory Inspector", NULL, memory_viewer_window.m_is_open)) {
+                memory_viewer_window.Toggle();
+            }
+            ImGui::MenuItem("Memory Bookmarks", NULL);
+            ImGui::MenuItem("Code Notes", NULL);
+            ImGui::MenuItem("Rich Presence Monitor", NULL);
+            ImGui::Separator();
+            ImGui::MenuItem("Pointer Finder", NULL);
+            ImGui::MenuItem("Pointer Inspector", NULL);
+        }
+
         g_main_menu_height = ImGui::GetWindowHeight();
         ImGui::EndMainMenuBar();
     }

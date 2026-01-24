@@ -392,25 +392,7 @@ void MemoryViewerWindow::Draw()
     
     ImGui::SetNextWindowSize(ImVec2(900, 700), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Xbox Memory Viewer", &m_is_open)) {
-        
         DrawMemoryBrowserTab();
-        // // Tab bar for different views
-        // if (ImGui::BeginTabBar("MemoryTabs")) {
-            
-        //     // Memory Browser Tab (original functionality)
-        //     if (ImGui::BeginTabItem("Memory Browser")) {
-        //         DrawMemoryBrowserTab();
-        //         ImGui::EndTabItem();
-        //     }
-            
-        //     // Memory Usage Tab (new functionality)
-        //     if (ImGui::BeginTabItem("Usage Analysis")) {
-        //         DrawMemoryUsageTab();
-        //         ImGui::EndTabItem();
-        //     }
-            
-        //     ImGui::EndTabBar();
-        // }
     }
     ImGui::End();
 }
