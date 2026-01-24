@@ -9,6 +9,7 @@ xemu_ss.add(files(
   'main-menu.cc',
   'main.cc',
   'memory-viewer.cc',
+  'misc.cc',
   'menubar.cc',
   'monitor.cc',
   'notifications.cc',
