@@ -3926,7 +3926,7 @@ if have_block
   endif
 endif
 
-specific_ss.add(files('xemu-xbe.c', 'xemu-version.c'))
+specific_ss.add(files('xemu-xbe.c', 'xemu-version.c', 'xemu-memory-viewer.c', 'xemu-game-memory-usage.c'))
 
 common_ss.add(tomlplusplus)
 common_ss.add(genconfig)

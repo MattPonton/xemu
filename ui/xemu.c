@@ -367,6 +367,11 @@ static void handle_keydown(SDL_Event *ev)
             sdl2_window_resize(scon);
             gui_keysym = 1;
             break;
+        case SDL_SCANCODE_P:
+            runstate_is_running()
+                ? vm_stop(RUN_STATE_PAUSED)
+                : vm_start();
+            break;
         default:
             break;
         }

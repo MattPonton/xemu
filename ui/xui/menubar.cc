@@ -220,6 +220,9 @@ void ShowMainMenu()
             ImGui::MenuItem("Monitor", "~", &monitor_window.is_open);
             ImGui::MenuItem("Audio", NULL, &apu_window.m_is_open);
             ImGui::MenuItem("Video", NULL, &video_window.m_is_open);
+            if (ImGui::MenuItem("Memory Viewer", NULL, memory_viewer_window.m_is_open)) {
+                memory_viewer_window.Toggle();
+            }
 #ifdef CONFIG_RENDERDOC
             if (nv2a_dbg_renderdoc_available()) {
                 ImGui::MenuItem("RenderDoc: Capture", NULL, &g_capture_renderdoc_frame);

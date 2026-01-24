@@ -312,6 +312,7 @@ void xemu_hud_render(void)
     monitor_window.Draw();
     apu_window.Draw();
     video_window.Draw();
+    memory_viewer_window.Draw();
     compatibility_reporter_window.Draw();
 #if defined(_WIN32)
     update_window.Draw();
