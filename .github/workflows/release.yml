@@ -17,6 +17,9 @@ on:
         type: boolean
         default: false
 
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Build
@@ -29,6 +32,8 @@ jobs:
     needs: build
     if: ${{ inputs.pre-release }}
     uses: ./.github/workflows/delete-prerelease.yml
+    with:
+      tag: ${{ inputs.tag }}
 
   release:
     name: Create release
@@ -63,7 +68,7 @@ jobs:
         tag_name: ${{ inputs.tag }}
         target_commitish: ${{ inputs.pre-release && inputs.ref || '' }}
         body_path: CHANGELOG.md
-        draft: ${{ !inputs.pre-release }}
+        draft: false
         prerelease: ${{ inputs.pre-release }}
         files: |
           dist/xemu*.tar.zst

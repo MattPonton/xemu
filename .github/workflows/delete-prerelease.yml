@@ -2,19 +2,35 @@ name: Delete Pre-release
 
 on:
   workflow_call:
+    inputs:
+      tag:
+        description: "Tag name for the pre-release to delete"
+        required: true
+        type: string
+
+permissions:
+  contents: write
 
 jobs:
   delete:
     name: Delete pre-release
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
     - name: Delete pre-release
       env:
         GH_TOKEN: ${{ github.token }}
         GH_REPO: ${{ github.repository }}
+        TAG: ${{ inputs.tag }}
       run: |
-        if gh release view pre-release --json isPrerelease --jq '.isPrerelease' | grep -q true; then
-          gh release delete pre-release --yes --cleanup-tag || true
+        set -euo pipefail
+
+        # If the release doesn't exist, gh returns non-zero; treat that as "nothing to delete".
+        if gh release view "$TAG" --json isPrerelease --jq '.isPrerelease' >/dev/null 2>&1; then
+          if gh release view "$TAG" --json isPrerelease --jq '.isPrerelease' | grep -q true; then
+            gh release delete "$TAG" --yes --cleanup-tag || true
+          else
+            echo "Release '$TAG' exists but is not a prerelease; not deleting."
+          fi
+        else
+          echo "No release found for tag '$TAG'; nothing to delete."
         fi
