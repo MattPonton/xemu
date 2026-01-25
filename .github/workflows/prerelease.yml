@@ -3,7 +3,8 @@ name: Pre-release
 on:
   push:
     branches:
-      - master
+      - features/burai-zenin
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}
@@ -11,10 +12,10 @@ concurrency:
 
 jobs:
   release:
-    name: Pre-release
-    if: github.repository_owner == 'xemu-project'
+    name: Pre-release for DOA2U Burai Zenin Fix
+    if: github.repository_owner == 'MattPonton'
     uses: ./.github/workflows/release.yml
     with:
       ref: ${{ github.sha }}
-      tag: pre-release
+      tag: doa-pre-release
       pre-release: true
