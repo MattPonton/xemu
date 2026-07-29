@@ -18,6 +18,7 @@
 //
 #include "debug.hh"
 #include "common.hh"
+#include "misc.hh"
 #include "font-manager.hh"
 #include <vector>
 #include <algorithm> // optional, but handy
@@ -276,22 +277,20 @@ void MemoryViewerWindow::LoadDump()
         return;
     }
     
-    // Use noc_file_dialog to select file
-    const char *filter_pattern = "Binary files (*.bin)\0*.bin\0All files (*.*)\0*.*\0\0";
-    const char *selected_file = noc_file_dialog_open(
-        NOC_FILE_DIALOG_OPEN,
-        filter_pattern,
-        NULL,
-        "Select Memory Dump File"
-    );
-    
-    if (!selected_file) {
-        return; // User cancelled
-    }
-    
-    if (!xemu_memory_viewer_load_dump_file_virt(selected_file)) {
-        printf("Failed to load virtual dump: %s\n", selected_file);
-    }
+    // SDL3 file dialog (async: the callback runs when the user picks a file)
+    static const SDL_DialogFileFilter filters[] = {
+        { "Binary Files (*.bin)", "bin" },
+        { "All Files", "*" }
+    };
+
+    ShowOpenFileDialog(filters, 2, nullptr, [](const char *path) {
+        if (!path) {
+            return; // User cancelled
+        }
+        if (!xemu_memory_viewer_load_dump_file_virt(path)) {
+            printf("Failed to load virtual dump: %s\n", path);
+        }
+    });
 }
 
 uint32_t MemoryViewerWindow::SearchHexPattern(const char* hex_pattern, uint32_t start_addr)
@@ -435,7 +434,7 @@ static void AppendUtf8Codepoint(std::string& out, uint32_t cp)
     }
 }
 
-static std::string DecodeRowText(const uint8_t* bytes, size_t n,
+[[maybe_unused]] static std::string DecodeRowText(const uint8_t* bytes, size_t n,
                                  MemoryViewerWindow::TextEncoding enc)
 {
     std::string out;
@@ -863,13 +862,14 @@ void MemoryViewerWindow::DrawMemoryBrowserTab()
         const ImVec2 text_sz = ImGui::CalcTextSize("FF");
         const ImVec2 cell_sz(text_sz.x + pad_x * 2.0f, ImGui::GetTextLineHeight() + pad_y * 2.0f);
 
-        ImDrawList* dl = ImGui::GetWindowDrawList();
+        // Only needed by the custom-header table path below (currently disabled)
+        // ImDrawList* dl = ImGui::GetWindowDrawList();
         const float now = (float)ImGui::GetTime();
         const bool show_ascii = m_show_text_column; // can probably be unified with the original..
 
         // Header should reflect the current base address "column offset"
         //const uint32_t header_start = (m_bytes_per_row != 0) ? (m_current_address % m_bytes_per_row) : 0;
-        const uint32_t header_start = (m_current_address & 0x0Fu);
+        // const uint32_t header_start = (m_current_address & 0x0Fu);
 
         ImGuiTableFlags flags =
             ImGuiTableFlags_SizingFixedFit 

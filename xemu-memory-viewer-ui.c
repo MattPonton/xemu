@@ -9,7 +9,7 @@
 
 #include "xemu-memory-viewer.h"
 #include "ui/xemu.c"
-#include "sysemu/runstate.h"
+#include "system/runstate.h"
 
 // Global state for memory viewer UI
 static struct {

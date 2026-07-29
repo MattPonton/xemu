@@ -9,13 +9,15 @@
 
 #include "qemu/osdep.h"
 #include "hw/hw.h"
-#include "exec/memory.h"
-#include "exec/address-spaces.h"
+#include "system/memory.h" // MemoryRegion definition, memory_region_* helpers
+#include "system/address-spaces.h"
 #include "hw/xbox/nv2a/nv2a.h"
-#include "sysemu/runstate.h"
-#include "sysemu/cpus.h" // qemu_get_cpu
+#include "system/runstate.h"
+#include "system/cpus.h" // qemu_get_cpu
 #include "hw/core/cpu.h" // CPUState
 #include "exec/cpu-common.h" // cpu_memory_rw_debug
+
+#include "xemu-memory-viewer.h" // prototypes for the functions defined here
 
 #include <time.h>
 
