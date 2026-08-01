@@ -146,6 +146,65 @@ static bool pfifo_puller_should_stall(NV2AState *d)
            !can_fifo_access(d);
 }
 
+/*
+ * TEMPORARY INSTRUMENTATION -- not for upstream.
+ *
+ * Both renderers stall in the same places, at any resolution, with no CPU core
+ * saturated. That points at the pfifo thread waiting rather than computing, so
+ * split its wall time into three buckets and report once per second:
+ *
+ *   method    - inside pgraph_method(), i.e. real command processing
+ *   lock_wait - blocked acquiring pgraph.lock, i.e. contention with the CPU
+ *               thread (note this path drops pfifo.lock and takes pgraph.lock
+ *               for every method group -- see the "this is fucked" comments)
+ *   idle      - parked in qemu_cond_wait with nothing to do, i.e. the guest is
+ *               not feeding commands fast enough
+ *
+ * Whichever bucket dominates during a drop identifies where the frame goes.
+ */
+static struct {
+    int64_t window_start_us;
+    int64_t method_us;
+    int64_t lock_wait_us;
+    int64_t idle_us;
+    uint64_t num_methods;
+} nv2a_prof;
+
+/* Set to 1 to re-enable the pfifo phase timers. */
+#define NV2A_PROF_ENABLED 0
+
+static void nv2a_prof_report(void)
+{
+    if (!NV2A_PROF_ENABLED) {
+        return;
+    }
+
+    int64_t now = g_get_monotonic_time();
+
+    if (!nv2a_prof.window_start_us) {
+        nv2a_prof.window_start_us = now;
+        return;
+    }
+
+    int64_t elapsed = now - nv2a_prof.window_start_us;
+    if (elapsed < 1000000) {
+        return;
+    }
+
+    fprintf(stderr,
+            "[nv2a-prof] over %.2f s: method %.1f ms, lock_wait %.1f ms, "
+            "idle %.1f ms, methods %" PRIu64 "\n",
+            elapsed / 1000000.0, nv2a_prof.method_us / 1000.0,
+            nv2a_prof.lock_wait_us / 1000.0, nv2a_prof.idle_us / 1000.0,
+            nv2a_prof.num_methods);
+
+    nv2a_prof.window_start_us = now;
+    nv2a_prof.method_us = 0;
+    nv2a_prof.lock_wait_us = 0;
+    nv2a_prof.idle_us = 0;
+    nv2a_prof.num_methods = 0;
+}
+
 static ssize_t pfifo_run_puller(NV2AState *d, uint32_t method_entry,
                                 uint32_t parameter, uint32_t *parameters,
                                 size_t num_words_available,
@@ -186,7 +245,10 @@ static ssize_t pfifo_run_puller(NV2AState *d, uint32_t method_entry,
 
         // TODO: this is fucked
         qemu_mutex_unlock(&d->pfifo.lock);
+        int64_t t_lock = g_get_monotonic_time();
         qemu_mutex_lock(&d->pgraph.lock);
+        int64_t t_locked = g_get_monotonic_time();
+        nv2a_prof.lock_wait_us += t_locked - t_lock;
 
         // Switch contexts if necessary
         if (can_fifo_access(d)) {
@@ -195,6 +257,8 @@ static ssize_t pfifo_run_puller(NV2AState *d, uint32_t method_entry,
                 num_proc =
                     pgraph_method(d, subchannel, 0, entry.instance, parameters,
                                   num_words_available, max_lookahead_words, inc);
+                nv2a_prof.method_us += g_get_monotonic_time() - t_locked;
+                nv2a_prof.num_methods++;
             }
         }
 
@@ -221,12 +285,17 @@ static ssize_t pfifo_run_puller(NV2AState *d, uint32_t method_entry,
 
         // TODO: this is fucked
         qemu_mutex_unlock(&d->pfifo.lock);
+        int64_t t_lock = g_get_monotonic_time();
         qemu_mutex_lock(&d->pgraph.lock);
+        int64_t t_locked = g_get_monotonic_time();
+        nv2a_prof.lock_wait_us += t_locked - t_lock;
 
         if (can_fifo_access(d)) {
             num_proc =
                 pgraph_method(d, subchannel, method, parameter, parameters,
                               num_words_available, max_lookahead_words, inc);
+            nv2a_prof.method_us += g_get_monotonic_time() - t_locked;
+            nv2a_prof.num_methods++;
         }
 
         qemu_mutex_unlock(&d->pgraph.lock);
@@ -469,11 +538,15 @@ void *pfifo_thread(void *arg)
 
         pgraph_process_pending_reports(d);
 
+        nv2a_prof_report();
+
         if (!d->pfifo.fifo_kick) {
             qemu_cond_broadcast(&d->pfifo.fifo_idle_cond);
 
             // Both the pusher and puller are waiting for some action
+            int64_t t_idle = g_get_monotonic_time();
             qemu_cond_wait(&d->pfifo.fifo_cond, &d->pfifo.lock);
+            nv2a_prof.idle_us += g_get_monotonic_time() - t_idle;
         }
 
         if (d->exiting) {

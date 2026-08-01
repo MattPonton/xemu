@@ -19,6 +19,9 @@
 
 #include "qemu/osdep.h"
 #include "qemu/fast-hash.h"
+#include "xemu-version.h"
+#include "xemu-xbe.h"
+#include "ui/xemu-settings.h"
 #include "renderer.h"
 #include <math.h>
 
@@ -121,21 +124,408 @@ static bool pipeline_cache_entry_compare(Lru *lru, LruNode *node,
     return memcmp(&snode->key, key, sizeof(PipelineKey));
 }
 
+/*
+ * On-disk VkPipelineCache persistence.
+ *
+ * Driver-side pipeline compilation is the dominant cost when a game reaches
+ * geometry it has not drawn before, and without persistence it is paid again on
+ * every launch. The blob is only meaningful to the exact driver and device that
+ * produced it, so it is written with a header identifying both, plus the xemu
+ * version, and rejected if any of them differ.
+ *
+ * A rejected or corrupt cache is not an error: we simply start empty and
+ * recompile, exactly as before.
+ */
+
+#define VK_PIPELINE_CACHE_MAGIC 0x584B5043 /* 'XKPC' */
+#define VK_PIPELINE_CACHE_FORMAT_VERSION 2
+
+typedef struct VkPipelineCacheFileHeader {
+    uint32_t magic;
+    uint32_t format_version;
+    uint32_t vendor_id;
+    uint32_t device_id;
+    uint32_t driver_version;
+    uint32_t xemu_version_len;
+    uint64_t data_size;
+    uint8_t cache_uuid[VK_UUID_SIZE];
+} VkPipelineCacheFileHeader;
+
+/*
+ * EXPERIMENT -- not for upstream.
+ *
+ * Approximates what asynchronous pipeline creation would look like, without any
+ * of the threading. When a pipeline is created we pretend the compile took
+ * POPIN_SIMULATED_COMPILE_MS, and draws using it are skipped until then. The
+ * result is the same visual signature real async would produce -- geometry
+ * absent for a short period after it first appears -- so the artifact can be
+ * judged before committing to the actual implementation.
+ *
+ * Set to 0 to disable and render normally.
+ *
+ * For reference, measured glslang cost is ~2.8 ms per shader, so a 30-shader
+ * burst is ~84 ms on a single worker (~5 frames) and less across a pool. Try
+ * 16, 50, and 150 to bracket the plausible range.
+ */
+#define POPIN_SIMULATED_COMPILE_MS 0
+
+static inline bool pipeline_popin_should_skip(PGRAPHState *pg)
+{
+    PGRAPHVkState *r = pg->vk_renderer_state;
+
+    if (!POPIN_SIMULATED_COMPILE_MS || !r->pipeline_binding) {
+        return false;
+    }
+
+    /* Never skip while an occlusion query is in flight: the guest reads those
+     * results back and would see wrong values, which is a behavior change
+     * rather than a visual one.
+     */
+    if (pg->zpass_pixel_count_enable) {
+        return false;
+    }
+
+    return g_get_monotonic_time() < r->pipeline_binding->ready_at_us;
+}
+
+static void pipeline_cache_create_folder(void)
+{
+    g_autofree char *dir = g_strdup_printf("%spipeline_cache",
+                                           xemu_settings_get_base_path());
+    qemu_mkdir(dir);
+}
+
+/*
+ * Caches are kept per title. One game populated ~87MB in testing, so a single
+ * shared set would mean deserializing an unrelated game's pipelines at every
+ * launch. Titles without a certificate (dashboard, homebrew) share a default.
+ *
+ * The id is taken from renderer state rather than queried here, so that loads
+ * and saves always agree on the filename even though the running title is not
+ * known when the renderer initializes.
+ */
+static char *pipeline_cache_get_path(PGRAPHState *pg, int shard)
+{
+    PGRAPHVkState *r = pg->vk_renderer_state;
+
+    return g_strdup_printf("%spipeline_cache/%08x_%02d",
+                           xemu_settings_get_base_path(),
+                           r->pipeline_cache_title_id, shard);
+}
+
+static uint32_t pipeline_cache_current_title_id(void)
+{
+    struct xbe *xbe = xemu_get_xbe_info();
+
+    return (xbe && xbe->cert) ? xbe->cert->m_titleid : 0;
+}
+
+/* Returns malloc'd blob and sets *size, or NULL when unusable. */
+static void *pipeline_cache_load_from_disk(PGRAPHState *pg, int shard,
+                                           size_t *size)
+{
+    PGRAPHVkState *r = pg->vk_renderer_state;
+    g_autofree char *path = pipeline_cache_get_path(pg, shard);
+    VkPipelineCacheFileHeader header;
+    g_autofree char *cached_xemu_version = NULL;
+    void *data = NULL;
+
+    *size = 0;
+
+    const char *reason = "unknown";
+
+    FILE *f = qemu_fopen(path, "rb");
+    if (!f) {
+        return NULL;
+    }
+
+    if (fread(&header, sizeof(header), 1, f) != 1) {
+        reason = "short read on header";
+        goto reject;
+    }
+
+    if (header.magic != VK_PIPELINE_CACHE_MAGIC ||
+        header.format_version != VK_PIPELINE_CACHE_FORMAT_VERSION) {
+        reason = "bad magic or format version";
+        goto reject;
+    }
+
+    /* The blob is only valid for the device and driver that produced it. */
+    if (header.vendor_id != r->device_props.vendorID ||
+        header.device_id != r->device_props.deviceID ||
+        header.driver_version != r->device_props.driverVersion ||
+        memcmp(header.cache_uuid, r->device_props.pipelineCacheUUID,
+               VK_UUID_SIZE) != 0) {
+        reason = "device/driver mismatch";
+        goto reject;
+    }
+
+    if (header.xemu_version_len == 0 || header.xemu_version_len > 256) {
+        reason = "implausible xemu version length";
+        goto reject;
+    }
+
+    cached_xemu_version = g_malloc(header.xemu_version_len);
+    if (fread(cached_xemu_version, header.xemu_version_len, 1, f) != 1) {
+        reason = "short read on xemu version";
+        goto reject;
+    }
+    cached_xemu_version[header.xemu_version_len - 1] = '\0';
+    if (strcmp(cached_xemu_version, xemu_version) != 0) {
+        reason = "xemu version mismatch";
+        goto reject;
+    }
+
+    if (header.data_size == 0 || header.data_size > (256 << 20)) {
+        reason = "implausible data size";
+        goto reject;
+    }
+
+    data = g_malloc(header.data_size);
+    if (fread(data, header.data_size, 1, f) != 1) {
+        g_free(data);
+        data = NULL;
+        reason = "short read on cache data";
+        goto reject;
+    }
+
+    fclose(f);
+    *size = header.data_size;
+
+    /* Seed the change detector so a session that adds nothing new does not
+     * rewrite an identical blob. If the driver re-serializes differently we
+     * simply write once and settle.
+     */
+    r->pipeline_cache_last_saved_hash[shard] =
+        fast_hash(data, header.data_size);
+
+    return data;
+
+reject:
+    fclose(f);
+    fprintf(stderr, "[vk-pipeline-cache] shard %d load rejected (%s)\n", shard,
+            reason);
+    return NULL;
+}
+
+static void pipeline_cache_save_to_disk(PGRAPHState *pg, int shard)
+{
+    PGRAPHVkState *r = pg->vk_renderer_state;
+    size_t data_size = 0;
+
+    int64_t t_start = g_get_monotonic_time();
+
+    if (vkGetPipelineCacheData(r->device, r->vk_pipeline_caches[shard],
+                               &data_size, NULL) != VK_SUCCESS ||
+        data_size == 0) {
+        return;
+    }
+
+    g_autofree void *data = g_malloc(data_size);
+    if (vkGetPipelineCacheData(r->device, r->vk_pipeline_caches[shard],
+                               &data_size, data) != VK_SUCCESS) {
+        return;
+    }
+
+    int64_t t_fetched = g_get_monotonic_time();
+
+    /* Creating a pipeline does not necessarily add anything to the driver's
+     * cache -- it frequently hits an entry that is already there. Writing
+     * multiple MB back to disk in that case is pure cost, so only write when
+     * the blob has actually changed.
+     */
+    uint64_t hash = fast_hash(data, data_size);
+
+    int64_t t_hashed = g_get_monotonic_time();
+
+    if (hash == r->pipeline_cache_last_saved_hash[shard]) {
+        return;
+    }
+
+    g_autofree char *path = pipeline_cache_get_path(pg, shard);
+    g_autofree char *tmp_path = g_strdup_printf("%s.tmp", path);
+
+    /* Write to a temporary file and rename, so an interrupted write cannot
+     * leave a truncated cache behind.
+     */
+    FILE *f = qemu_fopen(tmp_path, "wb");
+    if (!f) {
+        return;
+    }
+
+    uint32_t xemu_version_len = strlen(xemu_version) + 1;
+    VkPipelineCacheFileHeader header = {
+        .magic = VK_PIPELINE_CACHE_MAGIC,
+        .format_version = VK_PIPELINE_CACHE_FORMAT_VERSION,
+        .vendor_id = r->device_props.vendorID,
+        .device_id = r->device_props.deviceID,
+        .driver_version = r->device_props.driverVersion,
+        .xemu_version_len = xemu_version_len,
+        .data_size = data_size,
+    };
+    memcpy(header.cache_uuid, r->device_props.pipelineCacheUUID, VK_UUID_SIZE);
+
+    bool ok = fwrite(&header, sizeof(header), 1, f) == 1 &&
+              fwrite(xemu_version, xemu_version_len, 1, f) == 1 &&
+              fwrite(data, data_size, 1, f) == 1;
+
+    fclose(f);
+
+    if (!ok) {
+        fprintf(stderr, "[vk-pipeline-cache] shard %d write failed\n", shard);
+        qemu_unlink(tmp_path);
+        return;
+    }
+
+    qemu_unlink(path);
+    if (rename(tmp_path, path) != 0) {
+        fprintf(stderr, "[vk-pipeline-cache] shard %d rename failed\n", shard);
+        qemu_unlink(tmp_path);
+        return;
+    }
+
+    r->pipeline_cache_last_saved_hash[shard] = hash;
+
+    int64_t t_written = g_get_monotonic_time();
+
+    fprintf(stderr,
+            "[vk-pipeline-cache] shard %d: %" PRIu64 " bytes | fetch %.2f ms, "
+            "hash %.2f ms, write %.2f ms, total %.2f ms\n",
+            shard, (uint64_t)data_size, (t_fetched - t_start) / 1000.0,
+            (t_hashed - t_fetched) / 1000.0, (t_written - t_hashed) / 1000.0,
+            (t_written - t_start) / 1000.0);
+}
+
+/* Number of newly created pipelines that must accumulate before writeback, and
+ * the minimum interval between writebacks. Together these keep the (multi-MB)
+ * blob write off the path of a game that is steadily compiling new pipelines,
+ * while still capturing a burst like a stage transition promptly.
+ */
+#define PIPELINE_CACHE_SAVE_THRESHOLD 8
+#define PIPELINE_CACHE_SAVE_INTERVAL_US (30 * 1000 * 1000)
+
+/*
+ * At most one shard is written per interval, globally. This check runs on every
+ * queue submit, so limiting per shard would still allow all of them to be
+ * written within a few frames -- which is precisely the stall sharding exists to
+ * avoid. Shards are visited round-robin so none is starved.
+ */
+/* (Re)create every shard cache from whatever is on disk for the current title.
+ * Pipelines already created remain valid: a VkPipeline is independent of the
+ * cache it was created from.
+ */
+static void pipeline_cache_open_shards(PGRAPHState *pg, bool destroy_existing)
+{
+    PGRAPHVkState *r = pg->vk_renderer_state;
+    size_t total_loaded = 0;
+
+    for (int i = 0; i < VK_PIPELINE_CACHE_SHARDS; i++) {
+        if (destroy_existing) {
+            vkDestroyPipelineCache(r->device, r->vk_pipeline_caches[i], NULL);
+        }
+
+        size_t initial_data_size = 0;
+        g_autofree void *initial_data =
+            pipeline_cache_load_from_disk(pg, i, &initial_data_size);
+
+        VkPipelineCacheCreateInfo cache_info = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
+            .flags = 0,
+            .initialDataSize = initial_data_size,
+            .pInitialData = initial_data,
+            .pNext = NULL,
+        };
+        if (vkCreatePipelineCache(r->device, &cache_info, NULL,
+                                  &r->vk_pipeline_caches[i]) != VK_SUCCESS) {
+            /* Retry empty: a driver may reject data we considered valid. */
+            cache_info.initialDataSize = 0;
+            cache_info.pInitialData = NULL;
+            VK_CHECK(vkCreatePipelineCache(r->device, &cache_info, NULL,
+                                           &r->vk_pipeline_caches[i]));
+            continue;
+        }
+
+        r->pipelines_created_since_save[i] = 0;
+        total_loaded += initial_data_size;
+    }
+
+    fprintf(stderr,
+            "[vk-pipeline-cache] title %08x: loaded %" PRIu64
+            " bytes across %d shards\n",
+            r->pipeline_cache_title_id, (uint64_t)total_loaded,
+            VK_PIPELINE_CACHE_SHARDS);
+}
+
+/* The renderer initializes before any XBE is loaded, so the first load uses the
+ * placeholder title id. Once the running title is known, reopen against its
+ * files -- otherwise saves and loads use different names and the cache is
+ * rebuilt from scratch on every launch.
+ */
+static void pipeline_cache_sync_title(PGRAPHState *pg)
+{
+    PGRAPHVkState *r = pg->vk_renderer_state;
+    uint32_t title_id = pipeline_cache_current_title_id();
+
+    if (title_id == r->pipeline_cache_title_id) {
+        return;
+    }
+
+    r->pipeline_cache_title_id = title_id;
+    pipeline_cache_open_shards(pg, true);
+}
+
+static void pipeline_cache_maybe_save(PGRAPHState *pg)
+{
+    PGRAPHVkState *r = pg->vk_renderer_state;
+    int64_t now = g_get_monotonic_time();
+
+    pipeline_cache_sync_title(pg);
+
+    if (!r->pipeline_cache_last_save_us) {
+        /* Start the clock at init rather than treating "never saved" as "due
+         * now", which would let the first burst write every shard back to back.
+         */
+        r->pipeline_cache_last_save_us = now;
+        return;
+    }
+
+    if ((now - r->pipeline_cache_last_save_us) <
+        PIPELINE_CACHE_SAVE_INTERVAL_US) {
+        return;
+    }
+
+    for (int n = 0; n < VK_PIPELINE_CACHE_SHARDS; n++) {
+        int i = (r->pipeline_cache_next_shard + n) % VK_PIPELINE_CACHE_SHARDS;
+
+        if (r->pipelines_created_since_save[i] <
+            PIPELINE_CACHE_SAVE_THRESHOLD) {
+            continue;
+        }
+
+        pipeline_cache_save_to_disk(pg, i);
+
+        r->pipelines_created_since_save[i] = 0;
+        r->pipeline_cache_last_save_us = now;
+        r->pipeline_cache_next_shard = (i + 1) % VK_PIPELINE_CACHE_SHARDS;
+        return;
+    }
+}
+
 static void init_pipeline_cache(PGRAPHState *pg)
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
 
-    VkPipelineCacheCreateInfo cache_info = {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
-        .flags = 0,
-        .initialDataSize = 0,
-        .pInitialData = NULL,
-        .pNext = NULL,
-    };
-    VK_CHECK(vkCreatePipelineCache(r->device, &cache_info, NULL,
-                                   &r->vk_pipeline_cache));
+    pipeline_cache_create_folder();
 
-    const size_t pipeline_cache_size = 2048;
+    r->pipeline_cache_title_id = pipeline_cache_current_title_id();
+    pipeline_cache_open_shards(pg, false);
+
+    /* DOA2U was observed creating ~129 pipelines per frame with 2048 entries:
+     * its working set exceeds the cache, so entries are evicted (destroying the
+     * VkPipeline) and immediately rebuilt. Each PipelineBinding is small
+     * relative to the cost of that churn.
+     */
+    const size_t pipeline_cache_size = 16384;
     lru_init(&r->pipeline_cache);
     r->pipeline_cache_entries =
         g_malloc_n(pipeline_cache_size, sizeof(PipelineBinding));
@@ -153,11 +543,17 @@ static void finalize_pipeline_cache(PGRAPHState *pg)
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
 
+    for (int i = 0; i < VK_PIPELINE_CACHE_SHARDS; i++) {
+        pipeline_cache_save_to_disk(pg, i);
+    }
+
     lru_flush(&r->pipeline_cache);
     g_free(r->pipeline_cache_entries);
     r->pipeline_cache_entries = NULL;
 
-    vkDestroyPipelineCache(r->device, r->vk_pipeline_cache, NULL);
+    for (int i = 0; i < VK_PIPELINE_CACHE_SHARDS; i++) {
+        vkDestroyPipelineCache(r->device, r->vk_pipeline_caches[i], NULL);
+    }
 }
 
 static char const *const quad_glsl =
@@ -596,14 +992,18 @@ static void create_clear_pipeline(PGRAPHState *pg)
         .basePipelineHandle = VK_NULL_HANDLE,
     };
 
+    int shard = hash % VK_PIPELINE_CACHE_SHARDS;
+
     VkPipeline pipeline;
-    VK_CHECK(vkCreateGraphicsPipelines(r->device, r->vk_pipeline_cache, 1,
-                                       &pipeline_info, NULL, &pipeline));
+    VK_CHECK(vkCreateGraphicsPipelines(r->device, r->vk_pipeline_caches[shard],
+                                       1, &pipeline_info, NULL, &pipeline));
 
     snode->pipeline = pipeline;
     snode->layout = layout;
     snode->render_pass = pipeline_info.renderPass;
     snode->draw_time = pg->draw_time;
+
+    r->pipelines_created_since_save[shard]++;
 
     r->pipeline_binding = snode;
     r->pipeline_binding_changed = true;
@@ -1004,14 +1404,21 @@ static void create_pipeline(PGRAPHState *pg)
         .subpass = 0,
         .basePipelineHandle = VK_NULL_HANDLE,
     };
+    int shard = hash % VK_PIPELINE_CACHE_SHARDS;
+
     VkPipeline pipeline;
-    VK_CHECK(vkCreateGraphicsPipelines(r->device, r->vk_pipeline_cache, 1,
-                                       &pipeline_create_info, NULL, &pipeline));
+    VK_CHECK(vkCreateGraphicsPipelines(r->device, r->vk_pipeline_caches[shard],
+                                       1, &pipeline_create_info, NULL,
+                                       &pipeline));
 
     snode->pipeline = pipeline;
     snode->layout = layout;
     snode->render_pass = pipeline_create_info.renderPass;
     snode->draw_time = pg->draw_time;
+    snode->ready_at_us = g_get_monotonic_time() +
+                         POPIN_SIMULATED_COMPILE_MS * 1000;
+
+    r->pipelines_created_since_save[shard]++;
 
     r->pipeline_binding = snode;
     r->pipeline_binding_changed = true;
@@ -1210,9 +1617,100 @@ const enum NV2A_PROF_COUNTERS_ENUM finish_reason_to_counter_enum[] = {
     [VK_FINISH_REASON_STALLED] = NV2A_PROF_FINISH_STALLED,
 };
 
+/*
+ * TEMPORARY INSTRUMENTATION -- not for upstream.
+ *
+ * pgraph_method() was measured at 4.1 us per call during a transition versus
+ * 0.28 us at 60 fps. Draw submission and GPU synchronization both happen inside
+ * it, on the pfifo thread, so split them out:
+ *
+ *   flush_draw - all of pgraph_vk_flush_draw(), i.e. building and recording a
+ *                draw, minus the finish time already counted separately
+ *   finish     - inside pgraph_vk_finish(), which submits and blocks on a fence
+ *
+ * If finish dominates, the pfifo thread is waiting on the GPU. If flush_draw
+ * dominates, the cost is CPU-side draw setup.
+ */
+static struct {
+    int64_t window_start_us;
+    int64_t flush_draw_us;
+    int64_t finish_us;
+    int64_t fence_wait_us;
+    int64_t attr_bind_us;
+    int64_t vtx_sync_us;
+    int64_t remap_us;
+    int64_t pre_draw_us;
+    int64_t pre_pipeline_us;
+    int64_t pre_desc_us;
+    int64_t record_us;
+    uint64_t num_draws;
+    uint64_t num_finishes;
+} draw_prof;
+
+/* Set to 1 to re-enable the per-phase draw timers. */
+#define DRAW_PROF_ENABLED 0
+
+#if DRAW_PROF_ENABLED
+#define DRAW_PROF_TIME(bucket, expr)                        \
+    do {                                                    \
+        int64_t _t0 = g_get_monotonic_time();               \
+        expr;                                               \
+        draw_prof.bucket += g_get_monotonic_time() - _t0;   \
+    } while (0)
+#else
+#define DRAW_PROF_TIME(bucket, expr) do { expr; } while (0)
+#endif
+
+static void draw_prof_report(void)
+{
+    if (!DRAW_PROF_ENABLED) {
+        return;
+    }
+
+    int64_t now = g_get_monotonic_time();
+
+    if (!draw_prof.window_start_us) {
+        draw_prof.window_start_us = now;
+        return;
+    }
+
+    int64_t elapsed = now - draw_prof.window_start_us;
+    if (elapsed < 1000000) {
+        return;
+    }
+
+    fprintf(stderr,
+            "[draw-prof] over %.2f s: flush_draw %.1f ms (%" PRIu64 ") = "
+            "attr %.1f + sync %.1f + remap %.1f + pre %.1f (pipe %.1f + "
+            "desc %.1f) + rec %.1f | finish %.1f ms (%" PRIu64 "), "
+            "fence_wait %.1f ms\n",
+            elapsed / 1000000.0, draw_prof.flush_draw_us / 1000.0,
+            draw_prof.num_draws, draw_prof.attr_bind_us / 1000.0,
+            draw_prof.vtx_sync_us / 1000.0, draw_prof.remap_us / 1000.0,
+            draw_prof.pre_draw_us / 1000.0,
+            draw_prof.pre_pipeline_us / 1000.0, draw_prof.pre_desc_us / 1000.0,
+            draw_prof.record_us / 1000.0, draw_prof.finish_us / 1000.0,
+            draw_prof.num_finishes, draw_prof.fence_wait_us / 1000.0);
+
+    draw_prof.window_start_us = now;
+    draw_prof.flush_draw_us = 0;
+    draw_prof.finish_us = 0;
+    draw_prof.fence_wait_us = 0;
+    draw_prof.attr_bind_us = 0;
+    draw_prof.vtx_sync_us = 0;
+    draw_prof.remap_us = 0;
+    draw_prof.pre_draw_us = 0;
+    draw_prof.pre_pipeline_us = 0;
+    draw_prof.pre_desc_us = 0;
+    draw_prof.record_us = 0;
+    draw_prof.num_draws = 0;
+    draw_prof.num_finishes = 0;
+}
+
 void pgraph_vk_finish(PGRAPHState *pg, FinishReason finish_reason)
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
+    int64_t t_finish_start = DRAW_PROF_ENABLED ? g_get_monotonic_time() : 0;
 
     assert(!r->in_draw);
     assert(r->debug_depth == 0);
@@ -1265,6 +1763,9 @@ void pgraph_vk_finish(PGRAPHState *pg, FinishReason finish_reason)
                                r->command_buffer_fence));
         r->submit_count += 1;
 
+        /* Safe point: work is submitted and we are not recording. */
+        pipeline_cache_maybe_save(pg);
+
         bool check_budget = false;
 
         // Periodically check memory budget
@@ -1279,8 +1780,10 @@ void pgraph_vk_finish(PGRAPHState *pg, FinishReason finish_reason)
             check_budget = true;
         }
 
+        int64_t t_fence = g_get_monotonic_time();
         VK_CHECK(vkWaitForFences(r->device, 1, &r->command_buffer_fence,
                                  VK_TRUE, UINT64_MAX));
+        draw_prof.fence_wait_us += g_get_monotonic_time() - t_fence;
 
         r->descriptor_set_index = 0;
         r->in_command_buffer = false;
@@ -1295,6 +1798,10 @@ void pgraph_vk_finish(PGRAPHState *pg, FinishReason finish_reason)
     pgraph_vk_process_pending_reports_internal(d);
 
     pgraph_vk_compute_finish_complete(r);
+
+    draw_prof.finish_us += g_get_monotonic_time() - t_finish_start;
+    draw_prof.num_finishes++;
+    draw_prof_report();
 }
 
 void pgraph_vk_begin_command_buffer(PGRAPHState *pg)
@@ -1363,9 +1870,9 @@ static void begin_pre_draw(PGRAPHState *pg)
     assert(!r->zeta_binding || r->zeta_binding->initialized);
 
     if (pg->clearing) {
-        create_clear_pipeline(pg);
+        DRAW_PROF_TIME(pre_pipeline_us, create_clear_pipeline(pg));
     } else {
-        create_pipeline(pg);
+        DRAW_PROF_TIME(pre_pipeline_us, create_pipeline(pg));
     }
 
     bool render_pass_dirty = r->pipeline_binding->render_pass != r->render_pass;
@@ -1381,7 +1888,7 @@ static void begin_pre_draw(PGRAPHState *pg)
         r->framebuffer_dirty = false;
     }
     if (!pg->clearing) {
-        pgraph_vk_update_descriptor_sets(pg);
+        DRAW_PROF_TIME(pre_desc_us, pgraph_vk_update_descriptor_sets(pg));
     }
     if (r->framebuffer_index == 0) {
         create_frame_buffer(pg);
@@ -2045,6 +2552,9 @@ void pgraph_vk_flush_draw(NV2AState *d)
     PGRAPHState *pg = &d->pgraph;
     PGRAPHVkState *r = pg->vk_renderer_state;
 
+    int64_t t_draw_start = DRAW_PROF_ENABLED ? g_get_monotonic_time() : 0;
+    int64_t finish_us_before = draw_prof.finish_us;
+
     if (!(r->color_binding || r->zeta_binding)) {
         NV2A_VK_DPRINTF("No binding present!!!\n");
         return;
@@ -2060,31 +2570,44 @@ void pgraph_vk_flush_draw(NV2AState *d)
         assert(pg->inline_buffer_length == 0);
         assert(pg->inline_array_length == 0);
 
-        pgraph_vk_bind_vertex_attributes(d, pg->draw_arrays_min_start,
-                                         pg->draw_arrays_max_count - 1, false,
-                                         0, pg->draw_arrays_max_count - 1);
+        DRAW_PROF_TIME(attr_bind_us,
+                       pgraph_vk_bind_vertex_attributes(
+                           d, pg->draw_arrays_min_start,
+                           pg->draw_arrays_max_count - 1, false, 0,
+                           pg->draw_arrays_max_count - 1));
         uint32_t min_element = INT_MAX;
         uint32_t max_element = 0;
         for (int i = 0; i < pg->draw_arrays_length; i++) {
             min_element = MIN(pg->draw_arrays_start[i], min_element);
             max_element = MAX(max_element, pg->draw_arrays_start[i] + pg->draw_arrays_count[i]);
         }
-        sync_vertex_ram_buffer(pg);
-        VertexBufferRemap remap = remap_unaligned_attributes(pg, max_element);
+        DRAW_PROF_TIME(vtx_sync_us, sync_vertex_ram_buffer(pg));
 
-        begin_pre_draw(pg);
-        copy_remapped_attributes_to_inline_buffer(pg, remap, 0, max_element);
+        VertexBufferRemap remap;
+        DRAW_PROF_TIME(remap_us,
+                       remap = remap_unaligned_attributes(pg, max_element));
+
+        DRAW_PROF_TIME(pre_draw_us, begin_pre_draw(pg));
+        DRAW_PROF_TIME(remap_us, copy_remapped_attributes_to_inline_buffer(
+                                     pg, remap, 0, max_element));
         pgraph_vk_begin_debug_marker(r, r->command_buffer, RGBA_BLUE,
                                      "Draw Arrays");
+        int64_t t_rec = DRAW_PROF_ENABLED ? g_get_monotonic_time() : 0;
         begin_draw(pg);
         bind_vertex_buffer(pg, remap.attributes, 0);
+        bool popin_skip = pipeline_popin_should_skip(pg);
         for (int i = 0; i < pg->draw_arrays_length; i++) {
             uint32_t start = pg->draw_arrays_start[i],
                      count = pg->draw_arrays_count[i];
             NV2A_VK_DPRINTF("- [%d] Start:%d Count:%d", i, start, count);
-            vkCmdDraw(r->command_buffer, count, 1, start, 0);
+            if (!popin_skip) {
+                vkCmdDraw(r->command_buffer, count, 1, start, 0);
+            }
         }
         end_draw(pg);
+        if (DRAW_PROF_ENABLED) {
+        draw_prof.record_us += g_get_monotonic_time() - t_rec;
+    }
         pgraph_vk_end_debug_marker(r, r->command_buffer);
 
         NV2A_VK_DGROUP_END();
@@ -2106,26 +2629,37 @@ void pgraph_vk_flush_draw(NV2AState *d)
             max_element = MAX(pg->inline_elements[i], max_element);
             min_element = MIN(pg->inline_elements[i], min_element);
         }
-        pgraph_vk_bind_vertex_attributes(
-            d, min_element, max_element, false, 0,
-            pg->inline_elements[pg->inline_elements_length - 1]);
-        sync_vertex_ram_buffer(pg);
-        VertexBufferRemap remap = remap_unaligned_attributes(pg, max_element + 1);
+        DRAW_PROF_TIME(attr_bind_us,
+                       pgraph_vk_bind_vertex_attributes(
+                           d, min_element, max_element, false, 0,
+                           pg->inline_elements[pg->inline_elements_length - 1]));
+        DRAW_PROF_TIME(vtx_sync_us, sync_vertex_ram_buffer(pg));
 
-        begin_pre_draw(pg);
-        copy_remapped_attributes_to_inline_buffer(pg, remap, 0, max_element + 1);
+        VertexBufferRemap remap;
+        DRAW_PROF_TIME(remap_us,
+                       remap = remap_unaligned_attributes(pg, max_element + 1));
+
+        DRAW_PROF_TIME(pre_draw_us, begin_pre_draw(pg));
+        DRAW_PROF_TIME(remap_us, copy_remapped_attributes_to_inline_buffer(
+                                     pg, remap, 0, max_element + 1));
         VkDeviceSize buffer_offset = pgraph_vk_update_index_buffer(
             pg, pg->inline_elements, index_data_size);
         pgraph_vk_begin_debug_marker(r, r->command_buffer, RGBA_BLUE,
                                      "Inline Elements");
+        int64_t t_rec = DRAW_PROF_ENABLED ? g_get_monotonic_time() : 0;
         begin_draw(pg);
         bind_vertex_buffer(pg, remap.attributes, 0);
         vkCmdBindIndexBuffer(r->command_buffer,
                              r->storage_buffers[BUFFER_INDEX].buffer,
                              buffer_offset, VK_INDEX_TYPE_UINT32);
-        vkCmdDrawIndexed(r->command_buffer, pg->inline_elements_length, 1, 0, 0,
-                         0);
+        if (!pipeline_popin_should_skip(pg)) {
+            vkCmdDrawIndexed(r->command_buffer, pg->inline_elements_length, 1,
+                             0, 0, 0);
+        }
         end_draw(pg);
+        if (DRAW_PROF_ENABLED) {
+        draw_prof.record_us += g_get_monotonic_time() - t_rec;
+    }
         pgraph_vk_end_debug_marker(r, r->command_buffer);
 
         NV2A_VK_DGROUP_END();
@@ -2161,7 +2695,9 @@ void pgraph_vk_flush_draw(NV2AState *d)
                                      "Inline Buffer");
         begin_draw(pg);
         bind_inline_vertex_buffer(pg, buffer_offset);
-        vkCmdDraw(r->command_buffer, pg->inline_buffer_length, 1, 0, 0);
+        if (!pipeline_popin_should_skip(pg)) {
+            vkCmdDraw(r->command_buffer, pg->inline_buffer_length, 1, 0, 0);
+        }
         end_draw(pg);
         pgraph_vk_end_debug_marker(r, r->command_buffer);
 
@@ -2205,12 +2741,23 @@ void pgraph_vk_flush_draw(NV2AState *d)
                                      "Inline Array");
         begin_draw(pg);
         bind_inline_vertex_buffer(pg, buffer_offset);
-        vkCmdDraw(r->command_buffer, index_count, 1, 0, 0);
+        if (!pipeline_popin_should_skip(pg)) {
+            vkCmdDraw(r->command_buffer, index_count, 1, 0, 0);
+        }
         end_draw(pg);
         pgraph_vk_end_debug_marker(r, r->command_buffer);
         NV2A_VK_DGROUP_END();
     } else {
         NV2A_VK_DPRINTF("EMPTY NV097_SET_BEGIN_END");
         NV2A_UNCONFIRMED("EMPTY NV097_SET_BEGIN_END");
+    }
+
+    /* Exclude any finish that happened inside this draw: it is reported on its
+     * own so the two buckets do not double count.
+     */
+    if (DRAW_PROF_ENABLED) {
+        draw_prof.flush_draw_us += (g_get_monotonic_time() - t_draw_start) -
+                                   (draw_prof.finish_us - finish_us_before);
+        draw_prof.num_draws++;
     }
 }

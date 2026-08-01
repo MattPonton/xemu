@@ -487,7 +487,7 @@ static void create_display_pipeline(PGRAPHState *pg)
         .subpass = 0,
         .basePipelineHandle = VK_NULL_HANDLE,
     };
-    VK_CHECK(vkCreateGraphicsPipelines(r->device, r->vk_pipeline_cache, 1,
+    VK_CHECK(vkCreateGraphicsPipelines(r->device, r->vk_pipeline_caches[0], 1,
                                        &pipeline_info, NULL,
                                        &r->display.pipeline));
 }

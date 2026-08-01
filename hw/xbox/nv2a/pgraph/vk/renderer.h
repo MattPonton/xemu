@@ -54,6 +54,9 @@ typedef struct MemorySyncRequirement {
 /* Max distinct vertex RAM byte ranges tracked per command buffer. */
 #define VK_MAX_VERTEX_RAM_REFERENCED 256
 
+/* Number of on-disk pipeline cache shards. */
+#define VK_PIPELINE_CACHE_SHARDS 16
+
 typedef struct RenderPassState {
     VkFormat color_format;
     VkFormat zeta_format;
@@ -81,6 +84,11 @@ typedef struct PipelineBinding {
     VkRenderPass render_pass;
     unsigned int draw_time;
     bool has_dynamic_line_width;
+
+    /* Experiment: time at which draws using this pipeline may be recorded,
+     * simulating asynchronous creation. See POPIN_SIMULATED_COMPILE_MS.
+     */
+    int64_t ready_at_us;
 } PipelineBinding;
 
 enum Buffer {
@@ -362,10 +370,36 @@ typedef struct PGRAPHVkState {
     bool in_draw;
 
     Lru pipeline_cache;
-    VkPipelineCache vk_pipeline_cache;
     PipelineBinding *pipeline_cache_entries;
     PipelineBinding *pipeline_binding;
     bool pipeline_binding_changed;
+
+    /* The driver's pipeline cache is sharded so that persisting it costs a
+     * fraction of the total. vkGetPipelineCacheData returns an opaque blob that
+     * cannot be split, and both fetching and writing it scale linearly with its
+     * size, so a single cache becomes progressively more expensive to save as a
+     * game populates it. Pipelines are assigned to a shard by key hash, which is
+     * stable, so lookups always consult the shard holding the entry.
+     *
+     * Writeback is opportunistic rather than at shutdown: xemu does not reliably
+     * tear down the device on exit.
+     */
+    VkPipelineCache vk_pipeline_caches[VK_PIPELINE_CACHE_SHARDS];
+    size_t pipelines_created_since_save[VK_PIPELINE_CACHE_SHARDS];
+    uint64_t pipeline_cache_last_saved_hash[VK_PIPELINE_CACHE_SHARDS];
+
+    /* Writeback is rate limited globally, not per shard: the save check runs on
+     * every queue submit, so a per-shard limit still permits every shard to be
+     * written within a few frames.
+     */
+    int64_t pipeline_cache_last_save_us;
+    int pipeline_cache_next_shard;
+
+    /* Title the on-disk caches currently correspond to. The renderer is
+     * initialized before any XBE is loaded, so the caches must be reloaded once
+     * the running title becomes known.
+     */
+    uint32_t pipeline_cache_title_id;
 
     VkDescriptorPool descriptor_pool;
     VkDescriptorSetLayout descriptor_set_layout;

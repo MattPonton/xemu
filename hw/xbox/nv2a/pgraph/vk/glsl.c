@@ -17,6 +17,8 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "qemu/fast-hash.h"
+#include "xemu-version.h"
 #include "ui/xemu-settings.h"
 #include "renderer.h"
 
@@ -364,14 +366,200 @@ static glslang_stage_t vk_shader_stage_to_glslang_stage(VkShaderStageFlagBits st
     }
 }
 
+/*
+ * On-disk SPIR-V cache.
+ *
+ * The VkPipelineCache only removes driver-side pipeline compilation. Translating
+ * GLSL to SPIR-V with glslang is xemu's own work and is not covered by it, so it
+ * is repeated on every launch -- measured at ~2.8 ms per module across ~1400
+ * modules in one session of Dead or Alive 2 Ultimate.
+ *
+ * Unlike pipeline cache blobs, this output depends only on the GLSL source, the
+ * shader stage, and the compiler built into xemu. It is therefore independent of
+ * GPU and driver, and entries stay valid across hardware changes. The xemu
+ * version is recorded so that a build with different shader codegen or a
+ * different glslang invalidates the cache.
+ */
+
+#define VK_SPV_CACHE_MAGIC 0x58535056 /* 'XSPV' */
+#define VK_SPV_CACHE_FORMAT_VERSION 1
+#define VK_SPV_CACHE_MAX_SIZE (16 << 20)
+
+typedef struct SpvCacheFileHeader {
+    uint32_t magic;
+    uint32_t format_version;
+    uint32_t stage;
+    uint32_t xemu_version_len;
+    uint64_t glsl_len;
+    uint64_t spirv_len;
+} SpvCacheFileHeader;
+
+static uint64_t spv_cache_hash(VkShaderStageFlagBits stage, const char *glsl)
+{
+    uint64_t h = fast_hash((const uint8_t *)glsl, strlen(glsl));
+
+    /* Fold the stage in: identical source can be valid for several stages. */
+    return h ^ ((uint64_t)stage * 0x9e3779b97f4a7c15ULL);
+}
+
+/* Entries are bucketed by the top hash bits, as the GL shader cache does, to
+ * avoid ending up with thousands of files in a single directory.
+ */
+static char *spv_cache_get_dir(uint64_t hash)
+{
+    return g_strdup_printf("%svk_shaders/%04x", xemu_settings_get_base_path(),
+                           (uint32_t)(hash >> 48));
+}
+
+static char *spv_cache_get_path(const char *dir, uint64_t hash)
+{
+    uint64_t mask = (uint64_t)0xffff << 48;
+
+    return g_strdup_printf("%s/%012" PRIx64, dir, hash & ~mask);
+}
+
+static GByteArray *spv_cache_load(uint64_t hash, VkShaderStageFlagBits stage,
+                                  const char *glsl)
+{
+    g_autofree char *dir = spv_cache_get_dir(hash);
+    g_autofree char *path = spv_cache_get_path(dir, hash);
+    g_autofree char *cached_version = NULL;
+    SpvCacheFileHeader header;
+    GByteArray *spirv = NULL;
+
+    FILE *f = qemu_fopen(path, "rb");
+    if (!f) {
+        return NULL;
+    }
+
+    if (fread(&header, sizeof(header), 1, f) != 1) {
+        goto reject;
+    }
+
+    if (header.magic != VK_SPV_CACHE_MAGIC ||
+        header.format_version != VK_SPV_CACHE_FORMAT_VERSION ||
+        header.stage != (uint32_t)stage || header.glsl_len != strlen(glsl)) {
+        goto reject;
+    }
+
+    if (header.xemu_version_len == 0 || header.xemu_version_len > 256) {
+        goto reject;
+    }
+
+    cached_version = g_malloc(header.xemu_version_len);
+    if (fread(cached_version, header.xemu_version_len, 1, f) != 1) {
+        goto reject;
+    }
+    cached_version[header.xemu_version_len - 1] = '\0';
+    if (strcmp(cached_version, xemu_version) != 0) {
+        goto reject;
+    }
+
+    if (header.spirv_len == 0 || header.spirv_len > VK_SPV_CACHE_MAX_SIZE) {
+        goto reject;
+    }
+
+    spirv = g_byte_array_sized_new(header.spirv_len);
+    g_byte_array_set_size(spirv, header.spirv_len);
+    if (fread(spirv->data, header.spirv_len, 1, f) != 1) {
+        g_byte_array_unref(spirv);
+        spirv = NULL;
+        goto reject;
+    }
+
+    fclose(f);
+    return spirv;
+
+reject:
+    fclose(f);
+    return NULL;
+}
+
+static void spv_cache_store(uint64_t hash, VkShaderStageFlagBits stage,
+                            const char *glsl, GByteArray *spirv)
+{
+    if (!spirv || !spirv->len || spirv->len > VK_SPV_CACHE_MAX_SIZE) {
+        return;
+    }
+
+    g_autofree char *dir = spv_cache_get_dir(hash);
+    g_autofree char *path = spv_cache_get_path(dir, hash);
+
+    /* Filesystem calls are expensive on some hosts and a scene change can miss
+     * dozens of modules back to back, so do as few as possible: write straight
+     * to the destination and only pay for mkdir when the open actually fails.
+     *
+     * Writing in place is safe because the header records spirv_len and
+     * spv_cache_load() rejects any file that does not read back that many
+     * bytes, so an interrupted write is discarded rather than used.
+     */
+    FILE *f = qemu_fopen(path, "wb");
+    if (!f) {
+        static bool parent_created;
+
+        if (!parent_created) {
+            g_autofree char *parent = g_strdup_printf(
+                "%svk_shaders", xemu_settings_get_base_path());
+            qemu_mkdir(parent);
+            parent_created = true;
+        }
+
+        qemu_mkdir(dir);
+
+        f = qemu_fopen(path, "wb");
+        if (!f) {
+            return;
+        }
+    }
+
+    uint32_t xemu_version_len = strlen(xemu_version) + 1;
+    SpvCacheFileHeader header = {
+        .magic = VK_SPV_CACHE_MAGIC,
+        .format_version = VK_SPV_CACHE_FORMAT_VERSION,
+        .stage = stage,
+        .xemu_version_len = xemu_version_len,
+        .glsl_len = strlen(glsl),
+        .spirv_len = spirv->len,
+    };
+
+    bool ok = fwrite(&header, sizeof(header), 1, f) == 1 &&
+              fwrite(xemu_version, xemu_version_len, 1, f) == 1 &&
+              fwrite(spirv->data, spirv->len, 1, f) == 1;
+
+    fclose(f);
+
+    if (!ok) {
+        qemu_unlink(path);
+    }
+}
+
 ShaderModuleInfo *pgraph_vk_create_shader_module_from_glsl(
     PGRAPHVkState *r, VkShaderStageFlagBits stage, const char *glsl)
 {
+    static uint64_t num_hits, num_misses;
+
     ShaderModuleInfo *info = g_malloc0(sizeof(*info));
     info->refcnt = 0;
     info->glsl = strdup(glsl);
-    info->spirv = pgraph_vk_compile_glsl_to_spv(
-        vk_shader_stage_to_glslang_stage(stage), glsl);
+
+    uint64_t hash = spv_cache_hash(stage, glsl);
+
+    info->spirv = spv_cache_load(hash, stage, glsl);
+    if (info->spirv) {
+        num_hits++;
+    } else {
+        num_misses++;
+        info->spirv = pgraph_vk_compile_glsl_to_spv(
+            vk_shader_stage_to_glslang_stage(stage), glsl);
+        spv_cache_store(hash, stage, glsl, info->spirv);
+    }
+
+    if (((num_hits + num_misses) % 250) == 0) {
+        fprintf(stderr,
+                "[vk-spv-cache] %" PRIu64 " hits, %" PRIu64 " compiled\n",
+                num_hits, num_misses);
+    }
+
     info->module = pgraph_vk_create_shader_module_from_spv(r, info->spirv);
     init_layout_from_spv(info);
     return info;

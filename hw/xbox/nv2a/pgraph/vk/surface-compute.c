@@ -282,7 +282,7 @@ static VkPipeline create_compute_pipeline(PGRAPHVkState *r, const char *glsl)
             },
     };
     VkPipeline pipeline;
-    VK_CHECK(vkCreateComputePipelines(r->device, r->vk_pipeline_cache, 1,
+    VK_CHECK(vkCreateComputePipelines(r->device, r->vk_pipeline_caches[0], 1,
                                        &pipeline_info, NULL,
                                        &pipeline));
 
