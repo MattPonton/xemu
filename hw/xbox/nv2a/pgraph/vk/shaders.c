@@ -438,12 +438,39 @@ static void apply_uniform_updates(ShaderUniformLayout *layout,
 }
 
 // FIXME: Dirty tracking
+/* Defined in draw.c; reported and reset by draw_prof_report(). */
+extern int64_t nv2a_vk_prof_vsh_values_us;
+extern int64_t nv2a_vk_prof_vsh_apply_us;
+extern int64_t nv2a_vk_prof_psh_values_us;
+extern int64_t nv2a_vk_prof_psh_apply_us;
+extern uint64_t nv2a_vk_prof_uniform_calls;
+
+/* Must be kept in sync with DRAW_PROF_ENABLED in draw.c, which owns the
+ * reporting. Leave at 0: these timers fire twice per uniform block on every
+ * draw, which is far too hot to instrument except when investigating.
+ */
+#define UNIFORM_PROF_ENABLED 0
+
+#if UNIFORM_PROF_ENABLED
+#define UNIFORM_PROF_TIME(bucket, expr)                 \
+    do {                                                \
+        int64_t _t0 = g_get_monotonic_time();           \
+        expr;                                           \
+        bucket += g_get_monotonic_time() - _t0;         \
+    } while (0)
+#else
+#define UNIFORM_PROF_TIME(bucket, expr) do { expr; } while (0)
+#endif
+
 static void update_shader_uniforms(PGRAPHState *pg)
 {
     NV2A_VK_DGROUP_BEGIN("%s", __func__);
 
     PGRAPHVkState *r = pg->vk_renderer_state;
     nv2a_profile_inc_counter(NV2A_PROF_SHADER_BIND);
+#if UNIFORM_PROF_ENABLED
+    nv2a_vk_prof_uniform_calls++;
+#endif
 
     assert(r->shader_binding);
     ShaderBinding *binding = r->shader_binding;
@@ -451,15 +478,20 @@ static void update_shader_uniforms(PGRAPHState *pg)
                                        &binding->psh.module_info->uniforms };
 
     VshUniformValues vsh_values;
-    pgraph_glsl_set_vsh_uniform_values(pg, &binding->state.vsh,
-                                  binding->vsh.uniform_locs, &vsh_values);
-    apply_uniform_updates(&binding->vsh.module_info->uniforms, VshUniformInfo,
+    UNIFORM_PROF_TIME(nv2a_vk_prof_vsh_values_us,
+                      pgraph_glsl_set_vsh_uniform_values(
+                          pg, &binding->state.vsh, binding->vsh.uniform_locs,
+                          &vsh_values));
+    UNIFORM_PROF_TIME(nv2a_vk_prof_vsh_apply_us,
+                      apply_uniform_updates(
+                          &binding->vsh.module_info->uniforms, VshUniformInfo,
                           binding->vsh.uniform_locs, &vsh_values,
-                          VshUniform__COUNT);
+                          VshUniform__COUNT));
 
     PshUniformValues psh_values;
-    pgraph_glsl_set_psh_uniform_values(pg, binding->psh.uniform_locs,
-                                       &psh_values);
+    UNIFORM_PROF_TIME(nv2a_vk_prof_psh_values_us,
+                      pgraph_glsl_set_psh_uniform_values(
+                          pg, binding->psh.uniform_locs, &psh_values));
     for (int i = 0; i < 4; i++) {
         assert(r->texture_bindings[i] != NULL);
         float scale = r->texture_bindings[i]->key.scale;
@@ -474,9 +506,11 @@ static void update_shader_uniforms(PGRAPHState *pg)
 
         psh_values.texScale[i] = scale;
     }
-    apply_uniform_updates(&binding->psh.module_info->uniforms, PshUniformInfo,
+    UNIFORM_PROF_TIME(nv2a_vk_prof_psh_apply_us,
+                      apply_uniform_updates(
+                          &binding->psh.module_info->uniforms, PshUniformInfo,
                           binding->psh.uniform_locs, &psh_values,
-                          PshUniform__COUNT);
+                          PshUniform__COUNT));
 
     for (int i = 0; i < ARRAY_SIZE(layouts); i++) {
         uint64_t hash =

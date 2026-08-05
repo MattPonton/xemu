@@ -25,6 +25,63 @@
 #include "renderer.h"
 #include <math.h>
 
+/* Set to 1 to re-enable the per-phase draw timers. */
+#define DRAW_PROF_ENABLED 0
+
+/* Breakdown of update_shader_uniforms(), which lives in shaders.c and runs on
+ * every draw regardless of whether any shader state changed.
+ */
+int64_t nv2a_vk_prof_vsh_values_us;
+int64_t nv2a_vk_prof_vsh_apply_us;
+int64_t nv2a_vk_prof_psh_values_us;
+int64_t nv2a_vk_prof_psh_apply_us;
+uint64_t nv2a_vk_prof_uniform_calls;
+
+static struct {
+    int64_t window_start_us;
+    int64_t flush_draw_us;
+    int64_t finish_us;
+    int64_t fence_wait_us;
+    int64_t attr_bind_us;
+    int64_t vtx_sync_us;
+    int64_t remap_us;
+    int64_t pre_draw_us;
+    int64_t pre_pipeline_us;
+    int64_t pre_desc_us;
+    int64_t record_us;
+    /* Breakdown of pre_pipeline_us (create_pipeline), to separate the cost of
+     * producing SPIR-V from the cost of the driver turning it into a pipeline.
+     */
+    int64_t pipe_tex_us;    /* pgraph_vk_bind_textures */
+    int64_t pipe_shader_us; /* pgraph_vk_bind_shaders: glslang + shader module */
+    int64_t pipe_dirty_us;  /* check_pipeline_dirty */
+    int64_t pipe_vkcreate_us; /* vkCreateGraphicsPipelines */
+    int64_t pipe_key_us;      /* init_pipeline_key + fast_hash + lru_lookup */
+    uint64_t num_vkcreate;
+    uint64_t num_keys;
+    /* On a pipeline cache miss, which part of the key changed since the last
+     * key we built? Tells us which state is generating permutations.
+     */
+    uint32_t miss_reg[9];
+    uint32_t miss_shader;
+    uint32_t miss_render_pass;
+    uint32_t miss_vertex;
+    uint32_t miss_total;
+    uint64_t num_draws;
+    uint64_t num_finishes;
+} draw_prof;
+
+#if DRAW_PROF_ENABLED
+#define DRAW_PROF_TIME(bucket, expr)                        \
+    do {                                                    \
+        int64_t _t0 = g_get_monotonic_time();               \
+        expr;                                               \
+        draw_prof.bucket += g_get_monotonic_time() - _t0;   \
+    } while (0)
+#else
+#define DRAW_PROF_TIME(bucket, expr) do { expr; } while (0)
+#endif
+
 void pgraph_vk_draw_begin(NV2AState *d)
 {
     PGRAPHState *pg = &d->pgraph;
@@ -844,6 +901,7 @@ static void create_clear_pipeline(PGRAPHState *pg)
 
     NV2A_VK_DPRINTF("Cache miss");
     nv2a_profile_inc_counter(NV2A_PROF_PIPELINE_GEN);
+
     memcpy(&snode->key, &key, sizeof(key));
 
     bool clear_any_color_channels =
@@ -995,8 +1053,11 @@ static void create_clear_pipeline(PGRAPHState *pg)
     int shard = hash % VK_PIPELINE_CACHE_SHARDS;
 
     VkPipeline pipeline;
-    VK_CHECK(vkCreateGraphicsPipelines(r->device, r->vk_pipeline_caches[shard],
-                                       1, &pipeline_info, NULL, &pipeline));
+    DRAW_PROF_TIME(pipe_vkcreate_us,
+                   VK_CHECK(vkCreateGraphicsPipelines(
+                       r->device, r->vk_pipeline_caches[shard], 1,
+                       &pipeline_info, NULL, &pipeline)));
+    draw_prof.num_vkcreate++;
 
     snode->pipeline = pipeline;
     snode->layout = layout;
@@ -1096,12 +1157,13 @@ static void create_pipeline(PGRAPHState *pg)
     NV2AState *d = container_of(pg, NV2AState, pgraph);
     PGRAPHVkState *r = pg->vk_renderer_state;
 
-    pgraph_vk_bind_textures(d);
-    pgraph_vk_bind_shaders(pg);
+    DRAW_PROF_TIME(pipe_tex_us, pgraph_vk_bind_textures(d));
+    DRAW_PROF_TIME(pipe_shader_us, pgraph_vk_bind_shaders(pg));
 
     // FIXME: If nothing was dirty, don't even try creating the key or hashing.
     //        Just use the same pipeline.
-    bool pipeline_dirty = check_pipeline_dirty(pg);
+    bool pipeline_dirty;
+    DRAW_PROF_TIME(pipe_dirty_us, pipeline_dirty = check_pipeline_dirty(pg));
 
     pgraph_clear_dirty_reg_map(pg);
     // FIXME: We could clear less
@@ -1112,11 +1174,24 @@ static void create_pipeline(PGRAPHState *pg)
         return;
     }
 
+    /* Everything from here to the lru_lookup runs on every draw whose state
+     * changed, hit or miss: a >1KB memset+build, a hash over the whole key,
+     * and a cache probe that memcmps the key again on each candidate.
+     */
     PipelineKey key;
-    init_pipeline_key(pg, &key);
-    uint64_t hash = fast_hash((void *)&key, sizeof(key));
+    LruNode *node;
+    uint64_t hash;
+    int64_t t_key = DRAW_PROF_ENABLED ? g_get_monotonic_time() : 0;
 
-    LruNode *node = lru_lookup(&r->pipeline_cache, hash, &key);
+    init_pipeline_key(pg, &key);
+    hash = fast_hash((void *)&key, sizeof(key));
+    node = lru_lookup(&r->pipeline_cache, hash, &key);
+
+    if (DRAW_PROF_ENABLED) {
+        draw_prof.pipe_key_us += g_get_monotonic_time() - t_key;
+        draw_prof.num_keys++;
+    }
+
     PipelineBinding *snode = container_of(node, PipelineBinding, node);
     if (snode->pipeline != VK_NULL_HANDLE) {
         NV2A_VK_DPRINTF("Cache hit");
@@ -1128,6 +1203,39 @@ static void create_pipeline(PGRAPHState *pg)
 
     NV2A_VK_DPRINTF("Cache miss");
     nv2a_profile_inc_counter(NV2A_PROF_PIPELINE_GEN);
+
+#if DRAW_PROF_ENABLED
+    {
+        static PipelineKey prev_key;
+        static bool have_prev;
+
+        if (have_prev) {
+            draw_prof.miss_total++;
+            for (int i = 0; i < ARRAY_SIZE(key.regs); i++) {
+                if (key.regs[i] != prev_key.regs[i]) {
+                    draw_prof.miss_reg[i]++;
+                }
+            }
+            if (memcmp(&key.shader_state, &prev_key.shader_state,
+                       sizeof(key.shader_state))) {
+                draw_prof.miss_shader++;
+            }
+            if (memcmp(&key.render_pass_state, &prev_key.render_pass_state,
+                       sizeof(key.render_pass_state))) {
+                draw_prof.miss_render_pass++;
+            }
+            if (memcmp(key.binding_descriptions, prev_key.binding_descriptions,
+                       sizeof(key.binding_descriptions)) ||
+                memcmp(key.attribute_descriptions,
+                       prev_key.attribute_descriptions,
+                       sizeof(key.attribute_descriptions))) {
+                draw_prof.miss_vertex++;
+            }
+        }
+        memcpy(&prev_key, &key, sizeof(prev_key));
+        have_prev = true;
+    }
+#endif
 
     memcpy(&snode->key, &key, sizeof(key));
 
@@ -1407,9 +1515,11 @@ static void create_pipeline(PGRAPHState *pg)
     int shard = hash % VK_PIPELINE_CACHE_SHARDS;
 
     VkPipeline pipeline;
-    VK_CHECK(vkCreateGraphicsPipelines(r->device, r->vk_pipeline_caches[shard],
-                                       1, &pipeline_create_info, NULL,
-                                       &pipeline));
+    DRAW_PROF_TIME(pipe_vkcreate_us,
+                   VK_CHECK(vkCreateGraphicsPipelines(
+                       r->device, r->vk_pipeline_caches[shard], 1,
+                       &pipeline_create_info, NULL, &pipeline)));
+    draw_prof.num_vkcreate++;
 
     snode->pipeline = pipeline;
     snode->layout = layout;
@@ -1631,36 +1741,6 @@ const enum NV2A_PROF_COUNTERS_ENUM finish_reason_to_counter_enum[] = {
  * If finish dominates, the pfifo thread is waiting on the GPU. If flush_draw
  * dominates, the cost is CPU-side draw setup.
  */
-static struct {
-    int64_t window_start_us;
-    int64_t flush_draw_us;
-    int64_t finish_us;
-    int64_t fence_wait_us;
-    int64_t attr_bind_us;
-    int64_t vtx_sync_us;
-    int64_t remap_us;
-    int64_t pre_draw_us;
-    int64_t pre_pipeline_us;
-    int64_t pre_desc_us;
-    int64_t record_us;
-    uint64_t num_draws;
-    uint64_t num_finishes;
-} draw_prof;
-
-/* Set to 1 to re-enable the per-phase draw timers. */
-#define DRAW_PROF_ENABLED 0
-
-#if DRAW_PROF_ENABLED
-#define DRAW_PROF_TIME(bucket, expr)                        \
-    do {                                                    \
-        int64_t _t0 = g_get_monotonic_time();               \
-        expr;                                               \
-        draw_prof.bucket += g_get_monotonic_time() - _t0;   \
-    } while (0)
-#else
-#define DRAW_PROF_TIME(bucket, expr) do { expr; } while (0)
-#endif
-
 static void draw_prof_report(void)
 {
     if (!DRAW_PROF_ENABLED) {
@@ -1683,14 +1763,50 @@ static void draw_prof_report(void)
             "[draw-prof] over %.2f s: flush_draw %.1f ms (%" PRIu64 ") = "
             "attr %.1f + sync %.1f + remap %.1f + pre %.1f (pipe %.1f + "
             "desc %.1f) + rec %.1f | finish %.1f ms (%" PRIu64 "), "
-            "fence_wait %.1f ms\n",
+            "fence_wait %.1f ms\n"
+            "            pipe %.1f = tex %.1f + shader %.1f + dirty %.1f + "
+            "key %.1f (%" PRIu64 ") + vkcreate %.1f (%" PRIu64 ")\n",
             elapsed / 1000000.0, draw_prof.flush_draw_us / 1000.0,
             draw_prof.num_draws, draw_prof.attr_bind_us / 1000.0,
             draw_prof.vtx_sync_us / 1000.0, draw_prof.remap_us / 1000.0,
             draw_prof.pre_draw_us / 1000.0,
             draw_prof.pre_pipeline_us / 1000.0, draw_prof.pre_desc_us / 1000.0,
             draw_prof.record_us / 1000.0, draw_prof.finish_us / 1000.0,
-            draw_prof.num_finishes, draw_prof.fence_wait_us / 1000.0);
+            draw_prof.num_finishes, draw_prof.fence_wait_us / 1000.0,
+            draw_prof.pre_pipeline_us / 1000.0, draw_prof.pipe_tex_us / 1000.0,
+            draw_prof.pipe_shader_us / 1000.0, draw_prof.pipe_dirty_us / 1000.0,
+            draw_prof.pipe_key_us / 1000.0, draw_prof.num_keys,
+            draw_prof.pipe_vkcreate_us / 1000.0, draw_prof.num_vkcreate);
+
+    if (nv2a_vk_prof_uniform_calls) {
+        fprintf(stderr,
+                "            uniforms (%" PRIu64 "): vsh_val %.1f + vsh_apply "
+                "%.1f + psh_val %.1f + psh_apply %.1f\n",
+                nv2a_vk_prof_uniform_calls,
+                nv2a_vk_prof_vsh_values_us / 1000.0,
+                nv2a_vk_prof_vsh_apply_us / 1000.0,
+                nv2a_vk_prof_psh_values_us / 1000.0,
+                nv2a_vk_prof_psh_apply_us / 1000.0);
+    }
+    nv2a_vk_prof_vsh_values_us = 0;
+    nv2a_vk_prof_vsh_apply_us = 0;
+    nv2a_vk_prof_psh_values_us = 0;
+    nv2a_vk_prof_psh_apply_us = 0;
+    nv2a_vk_prof_uniform_calls = 0;
+
+    if (draw_prof.miss_total) {
+        fprintf(stderr,
+                "            miss %u: shader %u, rpass %u, vtx %u | BLEND %u, "
+                "BLENDCOLOR %u, CTL0 %u, CTL1 %u, CTL2 %u, CTL3 %u, "
+                "SETUPRASTER %u, ZBIAS %u, ZFACTOR %u\n",
+                draw_prof.miss_total, draw_prof.miss_shader,
+                draw_prof.miss_render_pass, draw_prof.miss_vertex,
+                draw_prof.miss_reg[0], draw_prof.miss_reg[1],
+                draw_prof.miss_reg[2], draw_prof.miss_reg[3],
+                draw_prof.miss_reg[4], draw_prof.miss_reg[5],
+                draw_prof.miss_reg[6], draw_prof.miss_reg[7],
+                draw_prof.miss_reg[8]);
+    }
 
     draw_prof.window_start_us = now;
     draw_prof.flush_draw_us = 0;
@@ -1703,6 +1819,18 @@ static void draw_prof_report(void)
     draw_prof.pre_pipeline_us = 0;
     draw_prof.pre_desc_us = 0;
     draw_prof.record_us = 0;
+    draw_prof.pipe_tex_us = 0;
+    draw_prof.pipe_shader_us = 0;
+    draw_prof.pipe_dirty_us = 0;
+    draw_prof.pipe_vkcreate_us = 0;
+    draw_prof.pipe_key_us = 0;
+    draw_prof.num_vkcreate = 0;
+    draw_prof.num_keys = 0;
+    memset(draw_prof.miss_reg, 0, sizeof(draw_prof.miss_reg));
+    draw_prof.miss_shader = 0;
+    draw_prof.miss_render_pass = 0;
+    draw_prof.miss_vertex = 0;
+    draw_prof.miss_total = 0;
     draw_prof.num_draws = 0;
     draw_prof.num_finishes = 0;
 }
