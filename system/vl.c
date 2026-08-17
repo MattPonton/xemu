@@ -2977,6 +2977,26 @@ void qemu_init(int argc, char **argv)
 
     fake_argc = 0;
     fake_argv[fake_argc++] = argv[0];
+
+    /* Experimental: select a QEMU accelerator without rebuilding.
+     *
+     *   XEMU_ACCEL=kvm  ./xemu     (Linux)
+     *   XEMU_ACCEL=whpx ./xemu     (Windows)
+     *
+     * Unset -- the default -- leaves QEMU on TCG, which is xemu's normal and
+     * only tested configuration. The Xbox CPU is a 733MHz Pentium III and the
+     * host is x86-64, so hardware virtualization is at least theoretically
+     * applicable, and hw/xbox/xbox.c already carries kvm_enabled() paths while
+     * the surface code has !tcg_enabled() branches for hardware dirty tracking.
+     * Whether the MCPX boot ROM and NV2A timing actually survive it is what
+     * this switch exists to find out.
+     */
+    const char *xemu_accel = getenv("XEMU_ACCEL");
+    if (xemu_accel && xemu_accel[0]) {
+        fake_argv[fake_argc++] = strdup("-accel");
+        fake_argv[fake_argc++] = strdup(xemu_accel);
+    }
+
     fake_argv[fake_argc++] = strdup("-machine");
 
     char *bootrom_arg = NULL;
