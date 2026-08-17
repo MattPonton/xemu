@@ -253,11 +253,21 @@ get_and_ref_shader_module_for_key(PGRAPHVkState *r,
     return module->module_info;
 }
 
+/* Bumped whenever any ShaderBinding is (re)initialised. update_shader_uniforms()
+ * caches the last uniform values it wrote along with the binding they belong to,
+ * but bindings live in an LRU and a recycled node can reuse an address while
+ * pointing at entirely different shader modules and layout buffers. Comparing
+ * the generation as well as the pointer makes that case detectable.
+ */
+uint64_t nv2a_vk_shader_binding_generation;
+
 static void shader_cache_entry_init(Lru *lru, LruNode *node, const void *state)
 {
     PGRAPHVkState *r = container_of(lru, PGRAPHVkState, shader_cache);
     ShaderBinding *binding = container_of(node, ShaderBinding, node);
     memcpy(&binding->state, state, sizeof(ShaderState));
+
+    nv2a_vk_shader_binding_generation++;
 
     NV2A_VK_DPRINTF("cache miss");
     nv2a_profile_inc_counter(NV2A_PROF_SHADER_GEN);
@@ -438,28 +448,107 @@ static void apply_uniform_updates(ShaderUniformLayout *layout,
 }
 
 // FIXME: Dirty tracking
+/* Defined in draw.c; reported and reset by draw_prof_report(). */
+extern int64_t nv2a_vk_prof_vsh_values_us;
+extern int64_t nv2a_vk_prof_vsh_apply_us;
+extern int64_t nv2a_vk_prof_psh_values_us;
+extern int64_t nv2a_vk_prof_psh_apply_us;
+extern uint64_t nv2a_vk_prof_uniform_calls;
+
+/* Must be kept in sync with DRAW_PROF_ENABLED in draw.c, which owns the
+ * reporting. Leave at 0: these timers fire twice per uniform block on every
+ * draw, which is far too hot to instrument except when investigating.
+ */
+#define UNIFORM_PROF_ENABLED 0
+
+/* Counts how often the uniform buffers come out byte-identical to the previous
+ * draw. Reported by nv2a_prof_report() in pfifo.c; keep in sync with
+ * NV2A_PROF_ENABLED there. Costs nothing -- it reuses the hash the renderer
+ * already computes.
+ */
+#define UNIFORM_REDUNDANCY_PROF_ENABLED 0
+
+#if UNIFORM_REDUNDANCY_PROF_ENABLED
+extern uint64_t nv2a_prof_uniform_total;
+extern uint64_t nv2a_prof_uniform_vsh_same;
+extern uint64_t nv2a_prof_uniform_psh_same;
+extern uint64_t nv2a_prof_uniform_both_same;
+#endif
+
+#if UNIFORM_PROF_ENABLED
+#define UNIFORM_PROF_TIME(bucket, expr)                 \
+    do {                                                \
+        int64_t _t0 = g_get_monotonic_time();           \
+        expr;                                           \
+        bucket += g_get_monotonic_time() - _t0;         \
+    } while (0)
+#else
+#define UNIFORM_PROF_TIME(bucket, expr) do { expr; } while (0)
+#endif
+
 static void update_shader_uniforms(PGRAPHState *pg)
 {
     NV2A_VK_DGROUP_BEGIN("%s", __func__);
 
     PGRAPHVkState *r = pg->vk_renderer_state;
     nv2a_profile_inc_counter(NV2A_PROF_SHADER_BIND);
+#if UNIFORM_PROF_ENABLED
+    nv2a_vk_prof_uniform_calls++;
+#endif
 
     assert(r->shader_binding);
     ShaderBinding *binding = r->shader_binding;
     ShaderUniformLayout *layouts[] = { &binding->vsh.module_info->uniforms,
                                        &binding->psh.module_info->uniforms };
 
+    /* Games that submit large numbers of pre-transformed primitives (particle
+     * effects, rain, etc.) issue thousands of draws per frame whose uniforms
+     * never change -- in Dead Or Alive 2 Ultimate's rainy stages ~90% of draws
+     * recompute byte-identical values. Computing the values is cheap; writing
+     * them into the layout and re-hashing it is not. Remember what was last
+     * written and skip both when nothing moved.
+     *
+     * Only valid while the binding is unchanged: a different binding may point
+     * at different layout buffers, so the cached copy would not describe what
+     * those buffers actually hold.
+     */
+    static ShaderBinding *prev_binding;
+    static uint64_t prev_generation;
+    static VshUniformValues prev_vsh_values;
+    static PshUniformValues prev_psh_values;
+    /* Set to 0 to force every draw to upload its uniforms, restoring the
+     * original behaviour. Use this to confirm whether a suspected rendering
+     * glitch is caused by the skip below.
+     */
+#define UNIFORM_SKIP_ENABLED 1
+
+    bool same_binding = UNIFORM_SKIP_ENABLED &&
+                        (binding == prev_binding) &&
+                        (nv2a_vk_shader_binding_generation == prev_generation);
+
     VshUniformValues vsh_values;
-    pgraph_glsl_set_vsh_uniform_values(pg, &binding->state.vsh,
-                                  binding->vsh.uniform_locs, &vsh_values);
-    apply_uniform_updates(&binding->vsh.module_info->uniforms, VshUniformInfo,
-                          binding->vsh.uniform_locs, &vsh_values,
-                          VshUniform__COUNT);
+    UNIFORM_PROF_TIME(nv2a_vk_prof_vsh_values_us,
+                      pgraph_glsl_set_vsh_uniform_values(
+                          pg, &binding->state.vsh, binding->vsh.uniform_locs,
+                          &vsh_values));
+
+    bool vsh_unchanged =
+        same_binding &&
+        !memcmp(&vsh_values, &prev_vsh_values, sizeof(vsh_values));
+
+    if (!vsh_unchanged) {
+        UNIFORM_PROF_TIME(nv2a_vk_prof_vsh_apply_us,
+                          apply_uniform_updates(
+                              &binding->vsh.module_info->uniforms,
+                              VshUniformInfo, binding->vsh.uniform_locs,
+                              &vsh_values, VshUniform__COUNT));
+        memcpy(&prev_vsh_values, &vsh_values, sizeof(vsh_values));
+    }
 
     PshUniformValues psh_values;
-    pgraph_glsl_set_psh_uniform_values(pg, binding->psh.uniform_locs,
-                                       &psh_values);
+    UNIFORM_PROF_TIME(nv2a_vk_prof_psh_values_us,
+                      pgraph_glsl_set_psh_uniform_values(
+                          pg, binding->psh.uniform_locs, &psh_values));
     for (int i = 0; i < 4; i++) {
         assert(r->texture_bindings[i] != NULL);
         float scale = r->texture_bindings[i]->key.scale;
@@ -474,16 +563,52 @@ static void update_shader_uniforms(PGRAPHState *pg)
 
         psh_values.texScale[i] = scale;
     }
-    apply_uniform_updates(&binding->psh.module_info->uniforms, PshUniformInfo,
-                          binding->psh.uniform_locs, &psh_values,
-                          PshUniform__COUNT);
+    bool psh_unchanged =
+        same_binding &&
+        !memcmp(&psh_values, &prev_psh_values, sizeof(psh_values));
 
+    if (!psh_unchanged) {
+        UNIFORM_PROF_TIME(nv2a_vk_prof_psh_apply_us,
+                          apply_uniform_updates(
+                              &binding->psh.module_info->uniforms,
+                              PshUniformInfo, binding->psh.uniform_locs,
+                              &psh_values, PshUniform__COUNT));
+        memcpy(&prev_psh_values, &psh_values, sizeof(psh_values));
+    }
+
+    prev_binding = binding;
+    prev_generation = nv2a_vk_shader_binding_generation;
+
+    /* Skipping the apply above means the buffer still holds exactly what it
+     * held when we last hashed it, so the stored hash is still valid and there
+     * is nothing to re-hash.
+     */
+    bool unchanged[ARRAY_SIZE(layouts)] = { vsh_unchanged, psh_unchanged };
+    bool layout_same[ARRAY_SIZE(layouts)];
     for (int i = 0; i < ARRAY_SIZE(layouts); i++) {
+        if (unchanged[i]) {
+            layout_same[i] = true;
+            continue;
+        }
         uint64_t hash =
             fast_hash(layouts[i]->allocation, layouts[i]->total_size);
-        r->uniforms_changed |= (hash != r->uniform_buffer_hashes[i]);
+        layout_same[i] = (hash == r->uniform_buffer_hashes[i]);
+        r->uniforms_changed |= !layout_same[i];
         r->uniform_buffer_hashes[i] = hash;
     }
+
+#if UNIFORM_REDUNDANCY_PROF_ENABLED
+    nv2a_prof_uniform_total++;
+    if (layout_same[0]) {
+        nv2a_prof_uniform_vsh_same++;
+    }
+    if (layout_same[1]) {
+        nv2a_prof_uniform_psh_same++;
+    }
+    if (layout_same[0] && layout_same[1]) {
+        nv2a_prof_uniform_both_same++;
+    }
+#endif
 
     nv2a_profile_inc_counter(r->uniforms_changed ?
                                  NV2A_PROF_SHADER_UBO_DIRTY :
