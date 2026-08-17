@@ -451,6 +451,20 @@ extern uint64_t nv2a_vk_prof_uniform_calls;
  */
 #define UNIFORM_PROF_ENABLED 0
 
+/* Counts how often the uniform buffers come out byte-identical to the previous
+ * draw. Reported by nv2a_prof_report() in pfifo.c; keep in sync with
+ * NV2A_PROF_ENABLED there. Costs nothing -- it reuses the hash the renderer
+ * already computes.
+ */
+#define UNIFORM_REDUNDANCY_PROF_ENABLED 1
+
+#if UNIFORM_REDUNDANCY_PROF_ENABLED
+extern uint64_t nv2a_prof_uniform_total;
+extern uint64_t nv2a_prof_uniform_vsh_same;
+extern uint64_t nv2a_prof_uniform_psh_same;
+extern uint64_t nv2a_prof_uniform_both_same;
+#endif
+
 #if UNIFORM_PROF_ENABLED
 #define UNIFORM_PROF_TIME(bucket, expr)                 \
     do {                                                \
@@ -477,16 +491,40 @@ static void update_shader_uniforms(PGRAPHState *pg)
     ShaderUniformLayout *layouts[] = { &binding->vsh.module_info->uniforms,
                                        &binding->psh.module_info->uniforms };
 
+    /* Games that submit large numbers of pre-transformed primitives (particle
+     * effects, rain, etc.) issue thousands of draws per frame whose uniforms
+     * never change -- in Dead Or Alive 2 Ultimate's rainy stages ~90% of draws
+     * recompute byte-identical values. Computing the values is cheap; writing
+     * them into the layout and re-hashing it is not. Remember what was last
+     * written and skip both when nothing moved.
+     *
+     * Only valid while the binding is unchanged: a different binding may point
+     * at different layout buffers, so the cached copy would not describe what
+     * those buffers actually hold.
+     */
+    static ShaderBinding *prev_binding;
+    static VshUniformValues prev_vsh_values;
+    static PshUniformValues prev_psh_values;
+    bool same_binding = (binding == prev_binding);
+
     VshUniformValues vsh_values;
     UNIFORM_PROF_TIME(nv2a_vk_prof_vsh_values_us,
                       pgraph_glsl_set_vsh_uniform_values(
                           pg, &binding->state.vsh, binding->vsh.uniform_locs,
                           &vsh_values));
-    UNIFORM_PROF_TIME(nv2a_vk_prof_vsh_apply_us,
-                      apply_uniform_updates(
-                          &binding->vsh.module_info->uniforms, VshUniformInfo,
-                          binding->vsh.uniform_locs, &vsh_values,
-                          VshUniform__COUNT));
+
+    bool vsh_unchanged =
+        same_binding &&
+        !memcmp(&vsh_values, &prev_vsh_values, sizeof(vsh_values));
+
+    if (!vsh_unchanged) {
+        UNIFORM_PROF_TIME(nv2a_vk_prof_vsh_apply_us,
+                          apply_uniform_updates(
+                              &binding->vsh.module_info->uniforms,
+                              VshUniformInfo, binding->vsh.uniform_locs,
+                              &vsh_values, VshUniform__COUNT));
+        memcpy(&prev_vsh_values, &vsh_values, sizeof(vsh_values));
+    }
 
     PshUniformValues psh_values;
     UNIFORM_PROF_TIME(nv2a_vk_prof_psh_values_us,
@@ -506,18 +544,51 @@ static void update_shader_uniforms(PGRAPHState *pg)
 
         psh_values.texScale[i] = scale;
     }
-    UNIFORM_PROF_TIME(nv2a_vk_prof_psh_apply_us,
-                      apply_uniform_updates(
-                          &binding->psh.module_info->uniforms, PshUniformInfo,
-                          binding->psh.uniform_locs, &psh_values,
-                          PshUniform__COUNT));
+    bool psh_unchanged =
+        same_binding &&
+        !memcmp(&psh_values, &prev_psh_values, sizeof(psh_values));
 
+    if (!psh_unchanged) {
+        UNIFORM_PROF_TIME(nv2a_vk_prof_psh_apply_us,
+                          apply_uniform_updates(
+                              &binding->psh.module_info->uniforms,
+                              PshUniformInfo, binding->psh.uniform_locs,
+                              &psh_values, PshUniform__COUNT));
+        memcpy(&prev_psh_values, &psh_values, sizeof(psh_values));
+    }
+
+    prev_binding = binding;
+
+    /* Skipping the apply above means the buffer still holds exactly what it
+     * held when we last hashed it, so the stored hash is still valid and there
+     * is nothing to re-hash.
+     */
+    bool unchanged[ARRAY_SIZE(layouts)] = { vsh_unchanged, psh_unchanged };
+    bool layout_same[ARRAY_SIZE(layouts)];
     for (int i = 0; i < ARRAY_SIZE(layouts); i++) {
+        if (unchanged[i]) {
+            layout_same[i] = true;
+            continue;
+        }
         uint64_t hash =
             fast_hash(layouts[i]->allocation, layouts[i]->total_size);
-        r->uniforms_changed |= (hash != r->uniform_buffer_hashes[i]);
+        layout_same[i] = (hash == r->uniform_buffer_hashes[i]);
+        r->uniforms_changed |= !layout_same[i];
         r->uniform_buffer_hashes[i] = hash;
     }
+
+#if UNIFORM_REDUNDANCY_PROF_ENABLED
+    nv2a_prof_uniform_total++;
+    if (layout_same[0]) {
+        nv2a_prof_uniform_vsh_same++;
+    }
+    if (layout_same[1]) {
+        nv2a_prof_uniform_psh_same++;
+    }
+    if (layout_same[0] && layout_same[1]) {
+        nv2a_prof_uniform_both_same++;
+    }
+#endif
 
     nv2a_profile_inc_counter(r->uniforms_changed ?
                                  NV2A_PROF_SHADER_UBO_DIRTY :
