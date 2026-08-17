@@ -253,11 +253,21 @@ get_and_ref_shader_module_for_key(PGRAPHVkState *r,
     return module->module_info;
 }
 
+/* Bumped whenever any ShaderBinding is (re)initialised. update_shader_uniforms()
+ * caches the last uniform values it wrote along with the binding they belong to,
+ * but bindings live in an LRU and a recycled node can reuse an address while
+ * pointing at entirely different shader modules and layout buffers. Comparing
+ * the generation as well as the pointer makes that case detectable.
+ */
+uint64_t nv2a_vk_shader_binding_generation;
+
 static void shader_cache_entry_init(Lru *lru, LruNode *node, const void *state)
 {
     PGRAPHVkState *r = container_of(lru, PGRAPHVkState, shader_cache);
     ShaderBinding *binding = container_of(node, ShaderBinding, node);
     memcpy(&binding->state, state, sizeof(ShaderState));
+
+    nv2a_vk_shader_binding_generation++;
 
     NV2A_VK_DPRINTF("cache miss");
     nv2a_profile_inc_counter(NV2A_PROF_SHADER_GEN);
@@ -456,7 +466,7 @@ extern uint64_t nv2a_vk_prof_uniform_calls;
  * NV2A_PROF_ENABLED there. Costs nothing -- it reuses the hash the renderer
  * already computes.
  */
-#define UNIFORM_REDUNDANCY_PROF_ENABLED 1
+#define UNIFORM_REDUNDANCY_PROF_ENABLED 0
 
 #if UNIFORM_REDUNDANCY_PROF_ENABLED
 extern uint64_t nv2a_prof_uniform_total;
@@ -503,9 +513,18 @@ static void update_shader_uniforms(PGRAPHState *pg)
      * those buffers actually hold.
      */
     static ShaderBinding *prev_binding;
+    static uint64_t prev_generation;
     static VshUniformValues prev_vsh_values;
     static PshUniformValues prev_psh_values;
-    bool same_binding = (binding == prev_binding);
+    /* Set to 0 to force every draw to upload its uniforms, restoring the
+     * original behaviour. Use this to confirm whether a suspected rendering
+     * glitch is caused by the skip below.
+     */
+#define UNIFORM_SKIP_ENABLED 1
+
+    bool same_binding = UNIFORM_SKIP_ENABLED &&
+                        (binding == prev_binding) &&
+                        (nv2a_vk_shader_binding_generation == prev_generation);
 
     VshUniformValues vsh_values;
     UNIFORM_PROF_TIME(nv2a_vk_prof_vsh_values_us,
@@ -558,6 +577,7 @@ static void update_shader_uniforms(PGRAPHState *pg)
     }
 
     prev_binding = binding;
+    prev_generation = nv2a_vk_shader_binding_generation;
 
     /* Skipping the apply above means the buffer still holds exactly what it
      * held when we last hashed it, so the stored hash is still valid and there
