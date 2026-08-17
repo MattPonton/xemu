@@ -1416,7 +1416,6 @@ void pgraph_vk_bind_textures(NV2AState *d)
     PGRAPHState *pg = &d->pgraph;
     PGRAPHVkState *r = pg->vk_renderer_state;
 
-    // FIXME: Check for modifications on bind fastpath (CPU hook)
     // FIXME: Mark textures that are sourced from surfaces so we can track them
 
     r->texture_bindings_changed = false;
@@ -1426,6 +1425,29 @@ void pgraph_vk_bind_textures(NV2AState *d)
         NV2A_VK_DGROUP_END();
         update_timestamps(r);
         return;
+    }
+
+    /* Texture state being dirty does not imply the resulting bindings differ:
+     * create_texture() usually resolves to the same cache entry, and a content
+     * update is uploaded into the existing image. Record what descriptors would
+     * reference so the flag reflects an actual change.
+     *
+     * This matters because texture_bindings_changed forces check_pipeline_dirty()
+     * to fail, which in turn rebuilds and rehashes a PipelineKey on every draw.
+     *
+     * Image view and sampler are compared rather than the TextureBinding
+     * pointer, since an LRU entry may be evicted and reused for a different
+     * texture while keeping the same address.
+     */
+    struct {
+        VkImageView image_view;
+        VkSampler sampler;
+    } prev[NV2A_MAX_TEXTURES];
+
+    for (int i = 0; i < NV2A_MAX_TEXTURES; i++) {
+        TextureBinding *b = r->texture_bindings[i];
+        prev[i].image_view = b ? b->image_view : VK_NULL_HANDLE;
+        prev[i].sampler = b ? b->sampler : VK_NULL_HANDLE;
     }
 
     for (int i = 0; i < NV2A_MAX_TEXTURES; i++) {
@@ -1439,7 +1461,16 @@ void pgraph_vk_bind_textures(NV2AState *d)
         pg->texture_dirty[i] = false; // FIXME: Move to renderer?
     }
 
-    r->texture_bindings_changed = true;
+    for (int i = 0; i < NV2A_MAX_TEXTURES; i++) {
+        TextureBinding *b = r->texture_bindings[i];
+
+        if ((b ? b->image_view : VK_NULL_HANDLE) != prev[i].image_view ||
+            (b ? b->sampler : VK_NULL_HANDLE) != prev[i].sampler) {
+            r->texture_bindings_changed = true;
+            break;
+        }
+    }
+
     update_timestamps(r);
     NV2A_VK_DGROUP_END();
 }
