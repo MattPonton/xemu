@@ -171,7 +171,17 @@ static struct {
 } nv2a_prof;
 
 /* Set to 1 to re-enable the pfifo phase timers. */
-#define NV2A_PROF_ENABLED 0
+#define NV2A_PROF_ENABLED 1
+
+/* Uniform redundancy, filled in by shaders.c: how often update_shader_uniforms()
+ * recomputes values byte-identical to the previous draw's, against the same
+ * shader binding. High values mean the per-draw uniform upload is redundant,
+ * and that consecutive draws are candidates for merging into one draw call.
+ */
+uint64_t nv2a_prof_uniform_total;
+uint64_t nv2a_prof_uniform_vsh_same;
+uint64_t nv2a_prof_uniform_psh_same;
+uint64_t nv2a_prof_uniform_both_same;
 
 static void nv2a_prof_report(void)
 {
@@ -198,11 +208,26 @@ static void nv2a_prof_report(void)
             nv2a_prof.lock_wait_us / 1000.0, nv2a_prof.idle_us / 1000.0,
             nv2a_prof.num_methods);
 
+    if (nv2a_prof_uniform_total) {
+        double t = nv2a_prof_uniform_total;
+        fprintf(stderr,
+                "            uniforms %" PRIu64 ": vsh same %.1f%%, "
+                "psh same %.1f%%, both same %.1f%%\n",
+                nv2a_prof_uniform_total,
+                100.0 * nv2a_prof_uniform_vsh_same / t,
+                100.0 * nv2a_prof_uniform_psh_same / t,
+                100.0 * nv2a_prof_uniform_both_same / t);
+    }
+
     nv2a_prof.window_start_us = now;
     nv2a_prof.method_us = 0;
     nv2a_prof.lock_wait_us = 0;
     nv2a_prof.idle_us = 0;
     nv2a_prof.num_methods = 0;
+    nv2a_prof_uniform_total = 0;
+    nv2a_prof_uniform_vsh_same = 0;
+    nv2a_prof_uniform_psh_same = 0;
+    nv2a_prof_uniform_both_same = 0;
 }
 
 static ssize_t pfifo_run_puller(NV2AState *d, uint32_t method_entry,
