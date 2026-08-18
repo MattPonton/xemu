@@ -51,6 +51,11 @@ jobs:
           )
           mkdir -p ${LTO_CACHE_DIR}
         fi
+        # Experimental: ask for KVM by name. The meson option defaults to
+        # 'auto', which silently falls back to TCG when detection fails -- which
+        # is why shipped builds report "invalid accelerator kvm". Requesting it
+        # explicitly makes configure fail with a reason instead.
+        opts+=(--enable-kvm)
         echo "XEMU_BUILD_OPTIONS=${opts[*]}" >> "$GITHUB_ENV"
     - name: Initialize compiler cache
       id: cache
