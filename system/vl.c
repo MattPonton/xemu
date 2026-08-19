@@ -3036,10 +3036,25 @@ void qemu_init(int argc, char **argv)
         "none",
     }[g_config.sys.avpack];
 
-    fake_argv[fake_argc++] = g_strdup_printf("xbox%s%s%s,avpack=%s",
+    /* Experimental, paired with XEMU_ACCEL above: KVM rejects a userspace APIC,
+     * so kernel-irqchip=off makes -accel kvm fail outright. Allow overriding it
+     * to "on" or "split" for experimentation.
+     *
+     *   XEMU_IRQCHIP=split XEMU_ACCEL=kvm ./xemu
+     *
+     * Unset keeps the long-standing "off", which is what every tested xemu
+     * build uses. Whether the Xbox's interrupt routing survives an in-kernel
+     * irqchip is unknown and is the point of the switch.
+     */
+    const char *xemu_irqchip = getenv("XEMU_IRQCHIP");
+    if (!xemu_irqchip || !xemu_irqchip[0]) {
+        xemu_irqchip = "off";
+    }
+
+    fake_argv[fake_argc++] = g_strdup_printf("xbox%s%s,kernel-irqchip=%s,avpack=%s",
         (bootrom_arg != NULL) ? bootrom_arg : "",
         g_config.general.skip_boot_anim ? ",short-animation=on" : "",
-        ",kernel-irqchip=off",
+        xemu_irqchip,
         avpack_str
         );
 
