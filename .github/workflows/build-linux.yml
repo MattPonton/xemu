@@ -94,7 +94,7 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get -qy update
-        sudo apt-get install ccache libfuse2 libusb-1.0-0-dev #clang-21 lld-21 llvm-21-dev
+        sudo apt-get -qy install ccache libfuse2 libusb-1.0-0-dev #clang-21 lld-21 llvm-21-dev
         pushd src
         sudo apt-get -qy build-dep .
     - name: Install LLVM 21
