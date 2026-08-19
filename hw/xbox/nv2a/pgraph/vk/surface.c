@@ -1563,7 +1563,24 @@ static void update_surface_part(NV2AState *d, bool upload, bool color)
     }
 
     if (!upload && pg_surface->draw_dirty) {
-        if (!tcg_enabled()) {
+        /* Without TCG we cannot trap guest reads of a rendered surface, so the
+         * conservative fallback below reads every drawn surface back from the
+         * GPU -- roughly 30 full CPU/GPU syncs per frame in a busy scene, which
+         * costs far more than the guest CPU speedup KVM buys.
+         *
+         * XEMU_SKIP_SURFACE_DOWNLOAD=1 skips them, to measure what the frame
+         * rate would be if surface read-back were tracked properly rather than
+         * assumed. NOT correct: anything the guest actually reads back will be
+         * stale, so expect artifacts in effects that sample rendered surfaces.
+         * Diagnostic only.
+         */
+        static int skip_download = -1;
+        if (skip_download < 0) {
+            const char *env = getenv("XEMU_SKIP_SURFACE_DOWNLOAD");
+            skip_download = (env && env[0] && env[0] != '0') ? 1 : 0;
+        }
+
+        if (!tcg_enabled() && !skip_download) {
             // FIXME: Cannot monitor for reads/writes; flush now
             download_surface(d, color ? r->color_binding : r->zeta_binding,
                              true);
