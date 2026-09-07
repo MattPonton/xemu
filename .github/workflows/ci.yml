@@ -5,6 +5,10 @@ on:
   push:
     branches-ignore:
       - master
+      # Pre-release already runs the full build for this branch and publishes
+      # the result, so CI would only duplicate it -- doubling build time and
+      # the chances of hitting a flaky arm64 runner.
+      - features/burai-zenin
     tags-ignore:
       - "v*"
 
