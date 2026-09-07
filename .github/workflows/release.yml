@@ -39,7 +39,11 @@ jobs:
     name: Create release
     runs-on: ubuntu-latest
     needs: [build, delete_prerelease]
-    if: ${{ !cancelled() && needs.build.result == 'success' }}
+    # Upstream requires the entire build matrix to succeed. This fork only
+    # ships Windows and Linux x86_64, and GitHub's arm64 runners fail often
+    # enough (rate-limited action downloads) that gating on all of them means
+    # a release almost never gets published. Publish whatever did build.
+    if: ${{ !cancelled() }}
     steps:
     - name: Clone tree
       uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v4
