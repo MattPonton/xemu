@@ -200,10 +200,67 @@ int nv2a_get_screen_off(void)
     return g_nv2a->vga.sr[VGA_SEQ_CLOCK_MODE] & VGA_SR01_SCREEN_OFF;
 }
 
+/* Experimental: drive the PCRTC vblank interrupt from a fixed-rate timer
+ * instead of raising it as a side effect of the host display update.
+ *
+ *   XEMU_VBLANK_TIMER=1      enable at 60 Hz
+ *   XEMU_VBLANK_TIMER=59.94  enable at a specific rate
+ *
+ * By default vblank is raised from nv2a_vga_gfx_update(), so the emulated
+ * machine only learns that a frame boundary happened once the host has
+ * finished drawing one. A slow renderer therefore throttles the guest itself,
+ * which appears as the game running slowly rather than as dropped frames.
+ *
+ * Driving vblank from a timer decouples the two: the guest advances at its own
+ * rate and the host presents what it can. This changes emulated timing rather
+ * than making anything faster, so it stays off unless explicitly requested.
+ */
+static QEMUTimer *nv2a_vblank_timer;
+static int64_t nv2a_vblank_period_ns;
+
+static void nv2a_vblank_timer_cb(void *opaque)
+{
+    NV2AState *d = opaque;
+
+    d->pcrtc.pending_interrupts |= NV_PCRTC_INTR_0_VBLANK;
+    d->pcrtc.raster = 0;
+    nv2a_update_irq(d);
+
+    timer_mod(nv2a_vblank_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + nv2a_vblank_period_ns);
+}
+
+static void nv2a_vblank_timer_init(NV2AState *d)
+{
+    const char *env = getenv("XEMU_VBLANK_TIMER");
+    if (!env || !env[0] || env[0] == '0') {
+        return;
+    }
+
+    double hz = atof(env);
+    if (hz < 1.0) {
+        hz = 60.0;
+    }
+
+    nv2a_vblank_period_ns = (int64_t)(1000000000.0 / hz);
+    nv2a_vblank_timer =
+        timer_new_ns(QEMU_CLOCK_VIRTUAL, nv2a_vblank_timer_cb, d);
+    timer_mod(nv2a_vblank_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + nv2a_vblank_period_ns);
+
+    fprintf(stderr, "[nv2a] vblank driven by timer at %.2f Hz\n", hz);
+}
+
 static void nv2a_vga_gfx_update(void *opaque)
 {
     VGACommonState *vga = opaque;
     vga->hw_ops->gfx_update(vga);
+
+    if (nv2a_vblank_timer) {
+        /* vblank comes from the timer instead; raising it here as well would
+         * double the interrupt rate. */
+        return;
+    }
 
     NV2AState *d = container_of(vga, NV2AState, vga);
     d->pcrtc.pending_interrupts |= NV_PCRTC_INTR_0_VBLANK;
@@ -259,6 +316,8 @@ static void nv2a_init_vga(NV2AState *d)
     d->hw_ops = *vga->hw_ops;
     d->hw_ops.gfx_update = nv2a_vga_gfx_update;
     vga->con = graphic_console_init(DEVICE(d), 0, &d->hw_ops, vga);
+
+    nv2a_vblank_timer_init(d);
 
     /* hacky. swap out vga's vram */
     memory_region_destroy(&vga->vram);
